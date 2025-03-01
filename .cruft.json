@@ -1,0 +1,30 @@
+{
+  "template": "https://github.com/scverse/cookiecutter-scverse",
+  "commit": "052424af0b4c74a99a791bbfce7b2de15d780fc9",
+  "checkout": null,
+  "context": {
+    "cookiecutter": {
+      "project_name": "mbt",
+      "package_name": "mbt",
+      "project_description": "A rust parser for MIBI Binary files",
+      "author_full_name": "Sricharan Reddy Varra",
+      "author_email": "srivarra@stanford.edu",
+      "github_user": "srivarra",
+      "github_repo": "mbt",
+      "license": "MIT License",
+      "ide_integration": true,
+      "_copy_without_render": [
+        ".github/workflows/build.yaml",
+        ".github/workflows/test.yaml",
+        "docs/_templates/autosummary/**.rst"
+      ],
+      "_render_devdocs": false,
+      "_jinja2_env_vars": {
+        "lstrip_blocks": true,
+        "trim_blocks": true
+      },
+      "_template": "https://github.com/scverse/cookiecutter-scverse"
+    }
+  },
+  "directory": null
+}
