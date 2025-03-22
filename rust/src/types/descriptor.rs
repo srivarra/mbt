@@ -1,12 +1,14 @@
 //! Types for representing the MIBI descriptor JSON metadata
 
+use bon::Builder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
 /// Represents the JSON descriptor metadata in the MIBI file
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MibiDescriptor {
     // Common fields - add/modify based on your actual JSON structure
+    #[serde(rename = "fovName")]
+    pub fov_name: Option<String>,
     pub id: Option<String>,
     #[serde(rename = "backupStatus")]
     pub backup_status: Option<String>,
@@ -79,7 +81,6 @@ pub struct MibiDescriptor {
     pub hv_adc: Option<Vec<HvAdcChannel>>,
     #[serde(rename = "hvDac")]
     pub hv_dac: Option<Vec<HvDacChannel>>,
-
     // Data holder info (if present)
     #[serde(rename = "dataHolder")]
     pub data_holder: Option<DataHolder>,
@@ -93,6 +94,7 @@ pub struct MibiDescriptor {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FovInfo {
+    pub name: Option<String>,
     pub run: Option<RunInfo>,
     #[serde(rename = "scanCount")]
     pub scan_count: Option<i32>,
@@ -127,6 +129,7 @@ pub struct FovInfo {
     pub status: Option<String>,
     #[serde(rename = "triggerCount")]
     pub trigger_count: Option<i32>,
+    pub panel: Option<Panel>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -375,9 +378,8 @@ pub struct DataHolder {
 }
 
 // Channel information
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Builder)]
 pub struct Channel {
-    pub name: String,
     pub mass: Option<f64>,
     pub target: Option<String>,
     pub element: Option<String>,
@@ -393,40 +395,60 @@ pub struct Channel {
     pub lot: Option<String>,
     pub manufacture_date: Option<String>,
     pub conjugate_id: Option<i32>,
+}
+
+// Panel structure to match JSON format
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Panel {
+    pub id: Option<i32>,
+    pub description: Option<String>,
+    pub name: Option<String>,
+    pub dilution: Option<f64>,
+    #[serde(rename = "manufacture_date")]
+    pub manufacture_date: Option<String>,
+    pub conjugates: Option<Vec<Channel>>,
+    pub batches: Option<Vec<PanelBatch>>,
+    pub active: Option<bool>,
+    #[serde(rename = "previous_id")]
+    pub previous_id: Option<i32>,
+    #[serde(rename = "next_id")]
+    pub next_id: Option<i32>,
+    #[serde(rename = "is_draft")]
+    pub is_draft: Option<bool>,
+    #[serde(rename = "owned_by_user")]
+    pub owned_by_user: Option<bool>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Fallback structure for problematic JSON - simpler version that's more tolerant
+// Implement AsRef<[Channel]> for Panel
+impl AsRef<[Channel]> for Panel {
+    fn as_ref(&self) -> &[Channel] {
+        match &self.conjugates {
+            Some(conjugates) => conjugates.as_slice(),
+            None => &[],
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
-pub struct SimpleMibiDescriptor {
+pub struct PanelBatch {
+    #[serde(rename = "antibody_volume")]
+    pub antibody_volume: Option<f64>,
+    #[serde(rename = "buffer_volume")]
+    pub buffer_volume: Option<f64>,
+    pub id: Option<i32>,
+    #[serde(rename = "batch_id")]
+    pub batch_id: Option<i32>,
+    pub volume: Option<f64>,
+    #[serde(rename = "is_draft")]
+    pub is_draft: Option<bool>,
     #[serde(flatten)]
-    pub data: HashMap<String, serde_json::Value>,
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 // Implementation methods for MibiDescriptor
 impl MibiDescriptor {
-    /// Get a channel by name
-    pub fn get_channel_by_name(&self, name: &str) -> Option<&Channel> {
-        self.panel.as_ref()?.iter().find(|c| c.name == name)
-    }
-
-    /// Get a channel by mass
-    pub fn get_channel_by_mass(&self, mass: f64) -> Option<&Channel> {
-        self.panel
-            .as_ref()?
-            .iter()
-            .find(|c| c.mass.map_or(false, |m| (m - mass).abs() < 0.01))
-    }
-
-    /// Get all channel names
-    pub fn get_channel_names(&self) -> Vec<&str> {
-        match &self.panel {
-            Some(panel) => panel.iter().map(|c| c.name.as_str()).collect(),
-            None => vec![],
-        }
-    }
-
     /// Returns the number of frames in the file
     pub fn frame_count(&self) -> Option<i32> {
         // Try to get from timing, then from fov
@@ -475,5 +497,15 @@ impl MibiDescriptor {
         self.run_name
             .clone()
             .or_else(|| self.fov.as_ref()?.run.as_ref()?.name.clone())
+    }
+
+    /// Safely get fov mass_start value
+    pub fn fov_mass_start(&self) -> Option<f64> {
+        self.fov.as_ref()?.mass_start
+    }
+
+    /// Safely get fov mass_stop value
+    pub fn fov_mass_stop(&self) -> Option<f64> {
+        self.fov.as_ref()?.mass_stop
     }
 }

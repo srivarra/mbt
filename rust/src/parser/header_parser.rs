@@ -1,10 +1,10 @@
-use nom::{
-    IResult,
-    bytes::complete::take,
-    number::complete::le_u16,
+use winnow::{
+    Parser,
+    binary::le_u16,
+    token::take,
+    error::ContextError,
 };
 use crate::types::header::Header;
-
 
 /// Parses the header section of the binary file.
 ///
@@ -13,14 +13,14 @@ use crate::types::header::Header;
 /// - 4 little‑endian u16 values: num_x, num_y, triggers_per_pixel, num_frames
 /// - 2 bytes to skip (reserved)
 /// - 1 little‑endian u16: desc_len
-pub fn parse_header(input: &[u8]) -> IResult<&[u8], Header> {
-    let (input, file_signature) = take(6usize)(input)?;
-    let (input, size_x_pixels) = le_u16(input)?;
-    let (input, size_y_pixels) = le_u16(input)?;
-    let (input, triggers_per_pixel) = le_u16(input)?;
-    let (input, frame_count) = le_u16(input)?;
-    let (input, _) = take(2usize)(input)?;
-    let (rest, metadata_length) = le_u16(input)?;
+pub fn parse_header<'a>(input: &mut &'a [u8]) -> Result<Header, ContextError<&'a [u8]>> {
+    let file_signature = take(6usize).parse_next(input)?;
+    let size_x_pixels = le_u16.parse_next(input)?;
+    let size_y_pixels = le_u16.parse_next(input)?;
+    let triggers_per_pixel = le_u16.parse_next(input)?;
+    let frame_count = le_u16.parse_next(input)?;
+    let _ = take(2usize).parse_next(input)?;
+    let metadata_length = le_u16.parse_next(input)?;
 
     let header = Header::builder()
         .size_x_pixels(size_x_pixels)
@@ -30,5 +30,5 @@ pub fn parse_header(input: &[u8]) -> IResult<&[u8], Header> {
         .metadata_length(metadata_length)
         .file_signature(String::from_utf8_lossy(file_signature).into_owned())
         .build();
-    Ok((rest, header))
+    Ok(header)
 }

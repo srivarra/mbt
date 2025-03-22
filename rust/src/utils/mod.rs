@@ -2,10 +2,7 @@
 
 pub mod file_utils;
 pub mod misc;
-pub mod processing;
 pub mod channel_manager;
 
-// Re-export commonly used utility functions for convenience
-pub use file_utils::*;
-pub use misc::*;
-pub use self::channel_manager::ChannelManager;
+// Re-export commonly used utility functions and types for convenience
+pub use channel_manager::{extract_channels, find_by_target, find_by_mass};
