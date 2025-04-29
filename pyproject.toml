@@ -23,15 +23,15 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-  "numpydantic>=1.6.7",
-  "pydantic>=2.10.6",
+  "patito>=0.8.3",
+  "polars>=1.28.1",
   # for debug logging (referenced from the issue template)
   "session-info",
   "universal-pathlib",
+  "xarray[accel,parallel]>=2025.3.1",
 ]
 optional-dependencies.dev = [
   "pre-commit",
-  "twine>=4.0.2",
 ]
 optional-dependencies.doc = [
   "docutils>=0.8,!=0.18.*,!=0.19.*",

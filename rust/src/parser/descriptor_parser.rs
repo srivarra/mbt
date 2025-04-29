@@ -2,8 +2,8 @@
 
 use crate::types::descriptor::MibiDescriptor;
 use crate::types::header::Header;
-use winnow::{Parser, token::take, error::ContextError};
 use serde_json;
+use winnow::{Parser, error::ContextError, token::take};
 
 /// Parses the descriptor block as JSON metadata
 pub fn parse_descriptor<'a>(

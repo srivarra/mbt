@@ -1,10 +1,5 @@
-use winnow::{
-    Parser,
-    binary::le_u16,
-    token::take,
-    error::ContextError,
-};
 use crate::types::header::Header;
+use winnow::{Parser, binary::le_u16, error::ContextError, token::take};
 
 /// Parses the header section of the binary file.
 ///

@@ -30,3 +30,5 @@ rust/output_tiff/
 
 # IDE
 ./vscode/
+
+*.parquet

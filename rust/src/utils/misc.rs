@@ -1,4 +1,12 @@
 use crate::types::header::Header;
+use bon::Builder;
+
+/// Represents a 2D coordinate using row (y) and column (x).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Builder)]
+pub struct Coordinate {
+    pub y: usize,
+    pub x: usize,
+}
 
 /// Computes the data_start offset which is the sum of:
 ///  - A fixed header length (0x12 bytes)

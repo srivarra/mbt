@@ -1,22 +1,87 @@
 pub mod mibi_file;
 pub mod parser;
+pub mod processing;
 pub mod python;
 pub mod types;
 pub mod utils;
-pub mod processing;
 
-// Re-export core types for easier access
-pub use mibi_file::{MibiFile, ProcessingStats};
+// Add specific pyo3 imports
+pub use mibi_file::MibiFile;
+use pyo3::{
+    Bound,
+    PyErr,
+    PyResult,
+    pyfunction,
+    pymodule,
+    types::PyModule,
+    types::PyModuleMethods,
+    wrap_pyfunction,
+};
 pub use types::{
     MibiDescriptor, header::Header, offset_table::OffsetLookupTable, pixel_data::PixelData,
 };
 
-// Only keep imports actually used in the file
-use pyo3::prelude::*;
+use crate::parser::pixel_parser::PixelParseRegionError;
+use polars::prelude::DataFrame;
+use pyo3_polars::PyDataFrame;
+use std::path::PathBuf;
+
+// Removed unused import for the old standalone function
+// use crate::utils::misc::calculate_full_width_row_chunks;
+
+// --- Error Conversion for PyO3 ---
+// Implement conversion from our custom error to PyErr
+impl From<PixelParseRegionError> for PyErr {
+    fn from(err: PixelParseRegionError) -> PyErr {
+        pyo3::exceptions::PyValueError::new_err(err.to_string())
+    }
+}
 
 #[pyfunction]
 fn hello_world() -> PyResult<String> {
     Ok("Hello, world!".to_string())
+}
+
+/// Parses a MIBI file and returns its pixel data as a Polars DataFrame.
+///
+/// Args:
+///     file_path (str): Path to the .bin MIBI file.
+///     num_chunks (int): Number of chunks for parallel processing.
+///
+/// Returns:
+///     polars.DataFrame: A Polars DataFrame containing the pixel data.
+///
+/// Raises:
+///     FileNotFoundError: If the specified file cannot be opened.
+///     ValueError: If parsing fails due to invalid data, offsets, or file issues.
+///     RuntimeError: For other unexpected errors during file processing.
+#[pyfunction]
+#[pyo3(signature = (file_path, num_chunks = 16))]
+fn parse_mibi_file_to_py_df(file_path: PathBuf, num_chunks: u64) -> PyResult<(PyDataFrame, PyDataFrame)> {
+    let path_str = file_path.to_str().ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Invalid UTF-8 sequence in path: {}",
+            file_path.display()
+        ))
+    })?;
+
+    // 1. Open the MIBI file using the &str path
+    // Handle error directly instead of relying on From trait
+    let mibi_file = MibiFile::open(path_str).map_err(|e| -> PyErr {
+        pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+            "Failed to open file '{}': {}",
+            path_str, // Use path_str here for error message
+            e
+        ))
+    })?;
+
+    // 2. Parse the full image in parallel
+    // The From<PixelParseRegionError> for PyErr implementation is still valid
+    let df: DataFrame = mibi_file.parse_full_image_parallel(num_chunks as usize)?;
+    let panel = mibi_file.panel;
+
+    // 3. Wrap the Rust Polars DataFrame in PyDataFrame for returning to Python
+    Ok((PyDataFrame(df), PyDataFrame(panel)))
 }
 
 /// A Python module implemented in Rust. The name of this function must match
@@ -25,6 +90,7 @@ fn hello_world() -> PyResult<String> {
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hello_world, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_mibi_file_to_py_df, m)?)?;
     Ok(())
 }
 
@@ -92,33 +158,30 @@ mod tests {
             println!("Run name: {}", run_name);
         }
 
-        // Print offset table
-        // println!("Offset table: {:?}", mibi_file.offset_table);
+        // ===== 4. Test batch pixel parsing for a specific REGION =====
+        println!("\n===== Testing parallel full image parsing ====");
 
-        // Test pixel data extraction
-        let (x, y) = (10, 10);
-        let offset = mibi_file.offset_table.offsets[[y, x]] as usize;
-        let offset2 = mibi_file.offset_table.offsets[[y, x + 1]] as usize;
+        // Define number of chunks for parallel processing
+        let num_chunks = 32;
+        println!(
+            "\nParsing full image in parallel using {} chunks...",
+            num_chunks
+        );
 
-        // Create a copy of the data instead of a reference
-        let pixel_data_vec = mibi_file.mmap_data[offset..offset2].to_vec();
+        // Call the new method on MibiFile
+        let mut combined_df = mibi_file.parse_full_image_parallel(num_chunks)?;
 
-        println!("Offsets: {}, {}", offset, offset2);
-        use crate::parser::pixel_parser::parse_pixel_data;
-        let pixel_data = parse_pixel_data(&pixel_data_vec, &mibi_file.header)
-            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+        println!(
+            "Full image parsing successful. Combined DataFrame shape: {:?}",
+            combined_df.shape()
+        );
+        use polars_io::prelude::ParquetWriter;
+        let mut data_file = std::fs::File::create("../combined_df.parquet").unwrap();
+        ParquetWriter::new(&mut data_file).finish(&mut combined_df)?;
 
-        println!("Number of trigger events: {}", pixel_data.trigger_events.len());
-
-        // Print first 3 trigger events in detail
-        for (i, event) in pixel_data.trigger_events.iter().take(3).enumerate() {
-            println!("Trigger Event {}: {} pulses", i, event.num_pulses);
-            // Print first 2 pulses of each trigger event
-            for (j, pulse) in event.pulses.iter().take(2).enumerate() {
-                println!("  Pulse {}: time={}, width={}, intensity={}",
-                    j, pulse.time, pulse.width, pulse.intensity);
-            }
-        }
+        let mut metadata_file = std::fs::File::create("../metadata.parquet").unwrap();
+        let mut mibi_panel = mibi_file.panel;
+        ParquetWriter::new(&mut metadata_file).finish(&mut mibi_panel)?;
 
         Ok(())
     }
@@ -126,113 +189,24 @@ mod tests {
     #[test]
     fn test_mibi_file_extract_bin_data() -> Result<(), Box<dyn std::error::Error>> {
         let file_path = get_real_world_bin_file_path("fov-1-scan-1.bin");
-        println!("\nTesting MibiFile extract_bin_data with: {}", file_path.display());
+        println!(
+            "\nTesting MibiFile extract_bin_data with: {}",
+            file_path.display()
+        );
 
         // Open the file
         let mibi_file = MibiFile::open(file_path.to_str().unwrap())?;
 
-
-        let _mass_start = mibi_file.descriptor.fov_mass_start();
-        let _mass_stop = mibi_file.descriptor.fov_mass_stop();
-
         let df = &mibi_file.panel;
         println!("DataFrame: {:?}", df);
 
-        let df = mibi_file.find_channels_by_target("Calprotectin")?;
-        println!("DataFrame: {:?}", df);
+        let mass_start = df.column("mass_start")?;
+        let mass_stop = df.column("mass_stop")?;
+        println!("mass_start column: {:?}", mass_start);
+        println!("mass_stop column: {:?}", mass_stop);
+        println!("{}", mibi_file.get_summary());
 
-
-        // // Test 1: Using explicit ranges based on the real channels from the JSON
-        // println!("Test 1: Using explicit ranges based on real channel data");
-
-        // // Values from the JSON - Calprotectin (Ga69), Chymase (Ga71), SMA (Y89)
-        // let low_range = vec![68, 70, 88];  // Mass - 1 as a simple bin range
-        // let high_range = vec![70, 72, 90];  // Mass + 1 as a simple bin range
-        // let calc_intensity = vec![true, true, true];  // Calculate intensity for all channels
-
-        // let img_data_explicit = mibi_file.extract_bin_data(
-        //     Some(&low_range),
-        //     Some(&high_range),
-        //     Some(&calc_intensity),
-        // )?;
-
-        // println!("Explicit ranges - Image data shape: {:?}", img_data_explicit.shape());
-        // println!("Explicit ranges - Number of channels: {}", img_data_explicit.shape()[3]);
-
-        // // Report on each channel separately
-        // for i in 0..img_data_explicit.shape()[3] {
-        //     let channel_name = match i {
-        //         0 => "Calprotectin (Ga69)",
-        //         1 => "Chymase (Ga71)",
-        //         2 => "SMA (Y89)",
-        //         _ => "Unknown",
-        //     };
-
-        //     let counts_layer = img_data_explicit.slice(ndarray::s![0, .., .., i]);
-
-        //     // Calculate stats for this channel
-        //     let mut min_val = u32::MAX;
-        //     let mut max_val = 0u32;
-        //     let mut sum = 0u32;
-        //     let mut count = 0;
-
-        //     counts_layer.iter().for_each(|&x| {
-        //         if x < min_val { min_val = x; }
-        //         if x > max_val { max_val = x; }
-        //         sum += x;
-        //         count += 1;
-        //     });
-
-        //     let mean = if count > 0 { sum as f64 / count as f64 } else { 0.0 };
-
-        //     println!("Channel {} ({}) - min: {}, max: {}, mean: {:.2}",
-        //         i, channel_name, min_val, max_val, mean
-        //     );
-        // }
-
-        // // Test 2: Using descriptor-derived ranges
-        // println!("\nTest 2: Using descriptor-derived ranges");
-        // // Print available channels from descriptor
-        // let channel_details = mibi_file.get_channel_details();
-        // println!("Available channels in descriptor:");
-        // for (idx, (name, mass, mass_start, mass_stop)) in channel_details.iter().enumerate() {
-        //     println!(
-        //         "  {}: {} (mass={:?}, range={:?}-{:?})",
-        //         idx, name, mass, mass_start, mass_stop
-        //     );
-        // }
-
-        // // Extract using descriptor ranges
-        // let img_data_auto = mibi_file.extract_bin_data(None, None, None)?;
-
-        // println!("Auto ranges - Image data shape: {:?}", img_data_auto.shape());
-        // println!("Auto ranges - Number of channels: {}", img_data_auto.shape()[3]);
-
-        // // Print some sample counts for the first channel from the auto-derived data
-        // if img_data_auto.shape()[3] > 0 {
-        //     let counts_layer = img_data_auto.slice(ndarray::s![0, .., .., 0]);
-
-        //     // Use iteration to find min/max and sum for average
-        //     let mut min_val = u32::MAX;
-        //     let mut max_val = 0u32;
-        //     let mut sum = 0u32;
-        //     let mut count = 0;
-
-        //     counts_layer.iter().for_each(|&x| {
-        //         if x < min_val { min_val = x; }
-        //         if x > max_val { max_val = x; }
-        //         sum += x;
-        //         count += 1;
-        //     });
-
-        //     let mean = if count > 0 { sum as f64 / count as f64 } else { 0.0 };
-
-        //     println!("Auto first channel counts - min: {}, max: {}, mean: {:.2}",
-        //         min_val, max_val, mean
-        //     );
-        // } else {
-        //     println!("No channels found in auto-derived data");
-        // }
+        // let pixel_data = mibi_file
 
         Ok(())
     }

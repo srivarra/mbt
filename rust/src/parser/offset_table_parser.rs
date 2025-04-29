@@ -2,12 +2,7 @@
 
 use crate::types::header::Header;
 use crate::types::offset_table::OffsetLookupTable;
-use winnow::{
-    Parser,
-    binary::le_u64,
-    combinator::repeat,
-    error::ContextError,
-};
+use winnow::{Parser, binary::le_u64, combinator::repeat, error::ContextError};
 
 /// Parses the offset block into a vector of u64 offsets using winnow parsers
 pub fn parse_offset_table<'a>(
@@ -19,7 +14,6 @@ pub fn parse_offset_table<'a>(
     let size_y = header.size_y_pixels as usize;
     let frame_count = header.frame_count as usize;
     let total_pixels = size_x * size_y * frame_count;
-
 
     // Parse exactly total_pixels number of u64 values using repeat
     let offsets: Vec<u64> = repeat(total_pixels, le_u64).parse_next(input)?;

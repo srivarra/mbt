@@ -3,20 +3,29 @@ use polars::prelude::*;
 
 /// Create a DataFrame containing all channel information from a MibiDescriptor
 pub fn extract_channels(descriptor: &MibiDescriptor) -> Result<DataFrame, PolarsError> {
-
     // Then try to extract from fov.panel
     if let Some(ref fov) = descriptor.fov {
         if let Some(panel) = &fov.panel {
-            return to_dataframe(panel);
+            return to_dataframe(
+                panel,
+                descriptor.fov_mass_start(),
+                descriptor.fov_mass_stop(),
+            );
         }
     }
 
     // If we couldn't find any channels, return an error
-    Err(PolarsError::NoData("No channel information found in descriptor".into()))
+    Err(PolarsError::NoData(
+        "No channel information found in descriptor".into(),
+    ))
 }
 
 // Helper function to create DataFrame from Panel
-fn to_dataframe<T: AsRef<[Channel]>>(channels: T) -> Result<DataFrame, PolarsError> {
+fn to_dataframe<T: AsRef<[Channel]>>(
+    channels: T,
+    mass_start: Option<f64>,
+    mass_stop: Option<f64>,
+) -> Result<DataFrame, PolarsError> {
     let channels = channels.as_ref();
 
     // Extract all channel properties into separate vectors
@@ -24,8 +33,20 @@ fn to_dataframe<T: AsRef<[Channel]>>(channels: T) -> Result<DataFrame, PolarsErr
     let targets: Vec<Option<String>> = channels.iter().map(|c| c.target.clone()).collect();
     let elements: Vec<Option<String>> = channels.iter().map(|c| c.element.clone()).collect();
     let clones: Vec<Option<String>> = channels.iter().map(|c| c.clone.clone()).collect();
-    let mass_starts: Vec<Option<f64>> = channels.iter().map(|c| c.mass_start).collect();
-    let mass_stops: Vec<Option<f64>> = channels.iter().map(|c| c.mass_stop).collect();
+    let mass_starts: Vec<Option<f64>> = channels
+        .iter()
+        .map(|c| match (c.mass, mass_start) {
+            (Some(mass), Some(start)) => Some(mass - start.abs()),
+            _ => None,
+        })
+        .collect();
+    let mass_stops: Vec<Option<f64>> = channels
+        .iter()
+        .map(|c| match (c.mass, mass_stop) {
+            (Some(mass), Some(stop)) => Some(mass + stop.abs()),
+            _ => None,
+        })
+        .collect();
     let ids: Vec<Option<i32>> = channels.iter().map(|c| c.id).collect();
     let external_ids: Vec<Option<String>> =
         channels.iter().map(|c| c.external_id.clone()).collect();
@@ -66,11 +87,11 @@ pub fn find_by_target(df: &DataFrame, target: &str) -> Result<LazyFrame, PolarsE
     let target_lower = target.to_lowercase();
 
     // Perform a simple equality check with both lowercase and original target
-    Ok(df.clone().lazy()
-        .filter(
-            col("target").eq(lit(target))
-            .or(col("target").eq(lit(target_lower)))
-        ))
+    Ok(df.clone().lazy().filter(
+        col("target")
+            .eq(lit(target))
+            .or(col("target").eq(lit(target_lower))),
+    ))
 }
 
 /// Find a channel by mass with tolerance
@@ -81,13 +102,11 @@ pub fn find_by_mass(
 ) -> Result<LazyFrame, PolarsError> {
     let tolerance = tolerance.unwrap_or(0.1);
 
-    Ok(df.clone().lazy()
-        .filter(
+    Ok(df.clone().lazy().filter(
+        col("mass").is_not_null().and(
             col("mass")
-                .is_not_null()
-                .and(
-                    col("mass").gt_eq(lit(mass - tolerance))
-                    .and(col("mass").lt_eq(lit(mass + tolerance)))
-                )
-        ))
+                .gt_eq(lit(mass - tolerance))
+                .and(col("mass").lt_eq(lit(mass + tolerance))),
+        ),
+    ))
 }

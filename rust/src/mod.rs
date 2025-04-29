@@ -6,4 +6,4 @@ pub mod utils;
 pub mod processing;
 
 // Re-export core types for easier access
-pub use mibi_file::{MibiFile, ProcessingStats};
+pub use mibi_file::MibiFile;

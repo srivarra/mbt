@@ -9,3 +9,13 @@ pub struct Header {
     pub frame_count: u16,
     pub metadata_length: u16,
 }
+
+impl Header {
+    pub fn n_x_pixels(&self) -> usize {
+        self.size_x_pixels as usize
+    }
+
+    pub fn n_y_pixels(&self) -> usize {
+        self.size_y_pixels as usize
+    }
+}

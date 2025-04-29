@@ -17,6 +17,7 @@ pub struct PulseEvent {
 /// to extract the number of pulse events). Then, for each pulse event, a 5‑byte record follows.
 #[derive(Debug, Clone, PartialEq, Builder)]
 pub struct TriggerEvent {
+    // pub trigger_id: u16,
     pub num_pulses: u16,
     pub pulses: Vec<PulseEvent>,
 }

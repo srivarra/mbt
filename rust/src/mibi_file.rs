@@ -1,17 +1,18 @@
-use crate::parser::{parse_descriptor, parse_header, parse_offset_table};
-use crate::types::{
-    MibiDescriptor, header::Header, offset_table::OffsetLookupTable,
+use crate::{
+    parser::pixel_parser::{PixelParseRegionError, batch_parse_region_to_dataframe},
+    parser::{parse_descriptor, parse_header, parse_offset_table},
+    types::offset_table::OffsetLookupTable,
+    types::{MibiDescriptor, header::Header},
+    utils::misc::Coordinate,
 };
 
 use crate::utils::{
-    channel_manager::extract_channels, file_utils::read_binary_file_mmap,
-    channel_manager::find_by_target, channel_manager::find_by_mass,
+    channel_manager::extract_channels, channel_manager::find_by_mass,
+    channel_manager::find_by_target, file_utils::read_binary_file_mmap,
 };
-use crate::processing;
-use memmap2;
-use std::error::Error;
-use ndarray::Array4;
 use polars::prelude::*;
+use rayon::prelude::*;
+use std::error::Error;
 
 /// A structure representing a parsed MIBI file with efficient access methods
 pub struct MibiFile {
@@ -20,27 +21,6 @@ pub struct MibiFile {
     pub offset_table: OffsetLookupTable,
     pub mmap_data: memmap2::Mmap,
     pub panel: DataFrame,
-}
-
-/// Statistics collected during streaming processing
-pub struct ProcessingStats {
-    pub total_pixels: usize,
-    pub processed_pixels: usize,
-    pub total_pulses: u64,
-    pub max_pulse_time: u16,
-    pub max_pulse_intensity: u16,
-}
-
-impl From<processing::ProcessingStats> for ProcessingStats {
-    fn from(stats: processing::ProcessingStats) -> Self {
-        Self {
-            total_pixels: stats.total_pixels,
-            processed_pixels: stats.processed_pixels,
-            total_pulses: stats.total_pulses,
-            max_pulse_time: stats.max_pulse_time,
-            max_pulse_intensity: stats.max_pulse_intensity,
-        }
-    }
 }
 
 impl MibiFile {
@@ -56,8 +36,8 @@ impl MibiFile {
 
         // Parse the header
         let mut input = &mmap_data[..];
-        let header = parse_header(&mut input)
-            .map_err(|e| format!("Failed to parse header: {:?}", e))?;
+        let header =
+            parse_header(&mut input).map_err(|e| format!("Failed to parse header: {:?}", e))?;
 
         // Parse the descriptor
         let descriptor = parse_descriptor(&mut input, &header)
@@ -111,64 +91,8 @@ impl MibiFile {
         if let Some(instrument_id) = self.descriptor.instrument_id() {
             result.push_str(&format!("  Instrument: {}\n", instrument_id));
         }
-
-        // Mass calibration
-        if let Some(mass_cal) = self.descriptor.mass_calibration() {
-            result.push_str("\nMass Calibration:\n");
-            if let Some(masses) = &mass_cal.masses {
-                if let Some(bins) = &mass_cal.bins {
-                    for (i, (mass, bin)) in masses.iter().zip(bins.iter()).enumerate().take(5) {
-                        result.push_str(&format!(
-                            "  Point {}: Mass {} at bin {}\n",
-                            i + 1,
-                            mass,
-                            bin
-                        ));
-                    }
-                    if masses.len() > 5 {
-                        result.push_str(&format!("  ... and {} more points\n", masses.len() - 5));
-                    }
-                }
-            }
-        }
-
         result
     }
-
-    /// Extract bin file data into a 4D array (3 × x × y × channels)
-    ///
-    /// If low_range and high_range are provided, those values are prioritized.
-    /// Otherwise, the channel ranges are automatically derived from the descriptor.
-    ///
-    /// # Arguments
-    /// * `low_range` - Optional starting integration ranges for each channel
-    /// * `high_range` - Optional stopping integration ranges for each channel
-    /// * `calc_intensity` - Optional flags for calculating intensity and intensity*width
-    ///
-    /// # Returns
-    /// A 4D array with dimensions (3, x, y, channels) where the first dimension
-    /// represents [counts, intensity, intensity*width]
-    pub fn extract_bin_data(
-        &self,
-        low_range: Option<&[u16]>,
-        high_range: Option<&[u16]>,
-        calc_intensity: Option<&[bool]>,
-    ) -> Result<Array4<u32>, String> {
-        // Convert the offset_table to the format needed by extract_bin
-        let offset_table = self.offset_table.as_pixel_offsets(self.mmap_data.len() as u64);
-
-        // Call the extract_bin function with our parameters
-        processing::extract_bin(
-            &self.mmap_data,
-            &self.header,
-            &offset_table,
-            Some(&self.descriptor),
-            low_range,
-            high_range,
-            calc_intensity,
-        )
-    }
-
 
     /// Find channels by target name (case-insensitive)
     pub fn find_channels_by_target(&self, target: &str) -> Result<DataFrame, PolarsError> {
@@ -177,7 +101,11 @@ impl MibiFile {
     }
 
     /// Find a channel by mass with a given tolerance
-    pub fn find_channels_by_mass(&self, mass: f64, tolerance: Option<f64>) -> Result<DataFrame, PolarsError> {
+    pub fn find_channels_by_mass(
+        &self,
+        mass: f64,
+        tolerance: Option<f64>,
+    ) -> Result<DataFrame, PolarsError> {
         let lazy_frame = find_by_mass(&self.panel, mass, tolerance)?;
         lazy_frame.collect()
     }
@@ -191,14 +119,75 @@ impl MibiFile {
     pub fn get_channel_mass_ranges(&self) -> Result<(Option<f64>, Option<f64>), PolarsError> {
         let df = &self.panel;
 
-        let min_mass = df.column("mass")?
-            .f64()?
-            .min();
+        let min_mass = df.column("mass")?.f64()?.min();
 
-        let max_mass = df.column("mass")?
-            .f64()?
-            .max();
+        let max_mass = df.column("mass")?.f64()?.max();
 
         Ok((min_mass, max_mass))
+    }
+
+    /// Parses pixel data within a specified rectangular region into a Polars DataFrame.
+    ///
+    /// Arguments:
+    /// * `start_coord` - The top-left Coordinate { row, col } of the region (inclusive).
+    /// * `end_coord` - The bottom-right Coordinate { row, col } of the region (inclusive).
+    ///
+    /// Returns a Polars DataFrame containing pulses from the region, or a PixelParseRegionError.
+    pub fn parse_region_to_dataframe(
+        &self,
+        start_coord: Coordinate,
+        end_coord: Coordinate,
+    ) -> Result<DataFrame, PixelParseRegionError> {
+        // Call the underlying parser function with the file's data
+        batch_parse_region_to_dataframe(
+            &self.mmap_data,
+            &self.offset_table,
+            &self.header,
+            start_coord,
+            end_coord,
+        )
+    }
+
+    /// Parses the full image in parallel across multiple chunks.
+    ///
+    /// Arguments:
+    /// * `num_chunks` - The desired number of chunks to divide the image into for parallel processing.
+    ///
+    /// Returns a single Polars DataFrame containing pulses from the entire image, or an error.
+    pub fn parse_full_image_parallel(
+        &self,
+        num_chunks: usize,
+    ) -> Result<DataFrame, PixelParseRegionError> {
+        // Calculate chunk ranges for parallel processing
+        let chunk_ranges = self.offset_table.calculate_row_chunks(num_chunks, None); // None for full-width chunks
+
+        if chunk_ranges.is_empty() {
+            println!("Warning: No chunks generated for parallel processing.");
+            return Ok(DataFrame::default());
+        }
+
+        // Process chunks in parallel and collect resulting DataFrames
+        let chunk_dfs: Vec<DataFrame> = chunk_ranges
+            .par_iter()
+            .map(|(start, end)| self.parse_region_to_dataframe(*start, *end))
+            .collect::<Result<Vec<_>, _>>()?; // Collect into Result<Vec<DataFrame>, Error>
+
+        // Use itertools::fold to concatenate the DataFrames sequentially
+        chunk_dfs
+            .into_iter()
+            .fold(Ok(DataFrame::default()), |acc_result, next_df| {
+                // Propagate previous error or perform vstack
+                acc_result.and_then(|acc_df| {
+                    if acc_df.height() == 0 {
+                        // If accumulator is empty (initial state), just take the next df
+                        Ok(next_df)
+                    } else {
+                        // Otherwise, vstack the next df onto the accumulator
+                        acc_df
+                            .vstack(&next_df)
+                            .map_err(PixelParseRegionError::DataFrameCreationFailed)
+                    }
+                })
+            })
     }
 }
