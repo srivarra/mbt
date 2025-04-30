@@ -23,10 +23,16 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "natsort>=8.4",
+  "numpydantic>=1.6.8",
   "patito>=0.8.3",
   "polars>=1.28.1",
   # for debug logging (referenced from the issue template)
+  "pydantic>=2.11.3",
   "session-info",
+  "sparse>=0.16",
+  "spatial-image>=1.2.1",
+  "tqdm>=4.67.1",
   "universal-pathlib",
   "xarray[accel,parallel]>=2025.3.1",
 ]
@@ -50,11 +56,19 @@ optional-dependencies.doc = [
   "sphinxext-opengraph",
 ]
 optional-dependencies.nb = [
+  "datashader>=0.18",
+  "hvplot>=0.11.3",
+  "ipywidgets>=8.1.6",
+  "jupyter-bokeh>=4.0.5",
   "jupyterlab>=4.3.5",
 ]
 optional-dependencies.test = [
   "coverage",
   "pytest",
+]
+optional-dependencies.zarr = [
+  "ngff-zarr",
+  "zarr",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://mbt.readthedocs.io/"

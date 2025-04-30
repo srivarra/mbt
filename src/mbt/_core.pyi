@@ -3,7 +3,9 @@ from os import PathLike
 import polars as pl
 
 def hello_world() -> str: ...
-def parse_mibi_file_to_py_df(file_path: PathLike, num_chunks: int) -> tuple[pl.DataFrame, pl.DataFrame]:
+def parse_mibi_file_to_py_df(
+    file_path: PathLike, num_chunks: int
+) -> tuple[pl.DataFrame, pl.DataFrame, str, tuple[int, int]]:
     """Parse the MIBI binary file into two Polars DataFrames: one for pixel data and one for panel information.
 
     Parameters
@@ -18,5 +20,7 @@ def parse_mibi_file_to_py_df(file_path: PathLike, num_chunks: int) -> tuple[pl.D
         A tuple containing two Polars DataFrames:
         - The first DataFrame contains the pixel data.
         - The second DataFrame contains the panel information.
+        - The third string contains the mass calibration data.
+        - The fourth tuple contains the size of the image.
     """
     ...

@@ -1,0 +1,77 @@
+import polars as pl
+
+
+def _mass_to_tof(mass_expr: pl.Expr, mass_offset: float, mass_gain: float, time_resolution: float) -> pl.Expr:
+    """Converts a mass Polars expression to a time-of-flight expression.
+
+    Args:
+        mass_expr: Polars expression representing m/z values.
+        mass_offset: Mass offset for parabolic transformation.
+        mass_gain: Mass gain for parabolic transformation.
+        time_resolution: Time resolution for scaling.
+
+    Returns
+    -------
+        Polars expression representing time-of-flight values (UInt16).
+    """
+    tof_expr = (mass_gain * mass_expr.sqrt() + mass_offset) / time_resolution
+    return tof_expr
+
+
+def _tof_to_mass(tof_expr: pl.Expr, mass_offset: float, mass_gain: float, time_resolution: float) -> pl.Expr:
+    """Converts a time-of-flight Polars expression to a mass expression.
+
+    Args:
+        tof_expr: Polars expression representing time-of-flight values.
+        mass_offset: Mass offset for parabolic transformation.
+        mass_gain: Mass gain for parabolic transformation.
+        time_resolution: Time resolution for scaling.
+
+    Returns
+    -------
+        Polars expression representing m/z values.
+    """
+    return (((time_resolution * tof_expr) - mass_offset) / mass_gain).pow(2)
+
+
+def _set_tof_ranges(panel: pl.DataFrame, mass_offset: float, mass_gain: float, time_resolution: float) -> pl.DataFrame:
+    """Calulates the lower and upper time-of-flight (TOF) range columns.
+
+    Calculates and adds lower/upper Time-of-Flight (TOF) range columns
+    to the panel DataFrame based on mass_start/mass_stop and calibration parameters.
+
+    Args:
+        panel: Polars DataFrame with 'mass_start' and 'mass_stop' columns.
+        mass_offset: Mass offset for parabolic transformation.
+        mass_gain: Mass gain for parabolic transformation.
+        time_resolution: The time resolution used in TOF calculations.
+
+    Returns
+    -------
+        A new Polars DataFrame with 'lower_tof_range' (UInt16) and
+        'upper_tof_range' (UInt16) added.
+
+    Raises
+    ------
+        ValueError: If the panel DataFrame lacks 'mass_start' or 'mass_stop'.
+    """
+    required_cols = ["mass_start", "mass_stop"]
+    if not all(col in panel.columns for col in required_cols):
+        missing = [col for col in required_cols if col not in panel.columns]
+        raise ValueError(f"Panel DataFrame must contain columns: {missing}")
+
+    updated_panel = panel.with_columns(
+        lower_tof_range=_mass_to_tof(
+            pl.col("mass_start"),
+            mass_offset=mass_offset,
+            mass_gain=mass_gain,
+            time_resolution=time_resolution,
+        ),
+        upper_tof_range=_mass_to_tof(
+            pl.col("mass_stop"),
+            mass_offset=mass_offset,
+            mass_gain=mass_gain,
+            time_resolution=time_resolution,
+        ),
+    )
+    return updated_panel

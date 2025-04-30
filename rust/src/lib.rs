@@ -1,22 +1,16 @@
 pub mod mibi_file;
 pub mod parser;
 pub mod processing;
-pub mod python;
 pub mod types;
 pub mod utils;
 
 // Add specific pyo3 imports
 pub use mibi_file::MibiFile;
 use pyo3::{
-    Bound,
-    PyErr,
-    PyResult,
-    pyfunction,
-    pymodule,
-    types::PyModule,
-    types::PyModuleMethods,
+    Bound, PyErr, PyResult, pyfunction, pymodule, types::PyModule, types::PyModuleMethods,
     wrap_pyfunction,
 };
+use serde::Serialize;
 pub use types::{
     MibiDescriptor, header::Header, offset_table::OffsetLookupTable, pixel_data::PixelData,
 };
@@ -24,6 +18,7 @@ pub use types::{
 use crate::parser::pixel_parser::PixelParseRegionError;
 use polars::prelude::DataFrame;
 use pyo3_polars::PyDataFrame;
+use serde_json;
 use std::path::PathBuf;
 
 // Removed unused import for the old standalone function
@@ -50,6 +45,7 @@ fn hello_world() -> PyResult<String> {
 ///
 /// Returns:
 ///     polars.DataFrame: A Polars DataFrame containing the pixel data.
+///     str: JSON string representation of the mass calibration data.
 ///
 /// Raises:
 ///     FileNotFoundError: If the specified file cannot be opened.
@@ -57,7 +53,10 @@ fn hello_world() -> PyResult<String> {
 ///     RuntimeError: For other unexpected errors during file processing.
 #[pyfunction]
 #[pyo3(signature = (file_path, num_chunks = 16))]
-fn parse_mibi_file_to_py_df(file_path: PathBuf, num_chunks: u64) -> PyResult<(PyDataFrame, PyDataFrame)> {
+fn parse_mibi_file_to_py_df(
+    file_path: PathBuf,
+    num_chunks: u64,
+) -> PyResult<(PyDataFrame, PyDataFrame, String, (u16, u16))> {
     let path_str = file_path.to_str().ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "Invalid UTF-8 sequence in path: {}",
@@ -79,9 +78,30 @@ fn parse_mibi_file_to_py_df(file_path: PathBuf, num_chunks: u64) -> PyResult<(Py
     // The From<PixelParseRegionError> for PyErr implementation is still valid
     let df: DataFrame = mibi_file.parse_full_image_parallel(num_chunks as usize)?;
     let panel = mibi_file.panel;
+    let mass_calibration = mibi_file.descriptor.mass_calibration().ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(
+            "Mass calibration data not found in file descriptor",
+        )
+    })?;
 
-    // 3. Wrap the Rust Polars DataFrame in PyDataFrame for returning to Python
-    Ok((PyDataFrame(df), PyDataFrame(panel)))
+    // Serialize the mass_calibration struct to a JSON string
+    let mass_calibration_json = serde_json::to_string(&mass_calibration).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Failed to serialize mass calibration to JSON: {}",
+            e
+        ))
+    })?;
+
+    let size_y_pixels = mibi_file.header.n_y_pixels() as u16;
+    let size_x_pixels = mibi_file.header.n_x_pixels() as u16;
+
+    // 3. Wrap the Rust Polars DataFrame in PyDataFrame and return tuple
+    Ok((
+        PyDataFrame(df),
+        PyDataFrame(panel),
+        mass_calibration_json,
+        (size_x_pixels, size_y_pixels),
+    ))
 }
 
 /// A Python module implemented in Rust. The name of this function must match
