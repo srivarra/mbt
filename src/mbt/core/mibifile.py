@@ -1,6 +1,5 @@
-import time
 from collections.abc import Sequence
-from functools import cached_property
+from functools import cached_property, wraps
 from os import PathLike
 from typing import Any, Literal, TypedDict, Unpack
 
@@ -9,17 +8,32 @@ import numpydantic.dtype as ndt
 import patito as pt
 import polars as pl
 import xarray as xr
+from loguru import logger
 from numpydantic import NDArray
 from polars._typing import ParquetCompression
 from polars.io.cloud.credential_provider._providers import CredentialProviderFunction
 from tqdm.auto import tqdm
 from upath import UPath
-from zarr.storage import StoreLike
 
 from mbt._core import MibiReader
 from mbt.core.models import C, MassCalibrationModel, MibiDataModel, MibiFilePanelModel, UserPanelModel, X, Y
-from mbt.core.utils import _set_tof_ranges, format_image_name
+from mbt.core.utils import _set_tof_ranges, format_image_name, format_run_name
 from mbt.im import to_xarray
+
+
+# Helper decorator to handle potential errors during property loading
+def _property_loader(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            # Check if already computed by cached_property mechanism
+            return func(self, *args, **kwargs)
+        except (pt.DataFrameValidationError, Exception) as e:
+            prop_name = func.__name__
+            logger.error(f"Error loading property '{prop_name}' for file {self.file_path}: {e}")
+            raise  # Re-raise the original exception
+
+    return wrapper
 
 
 class WriteParquetKwargs(TypedDict):
@@ -44,10 +58,10 @@ class MibiFile:
     Context manager and data loader for MIBI binary files.
 
     Loads pixel data and associated metadata (panel, mass calibration) lazily
-    using a Rust backend. Validates data structures using Patito/Pydantic models.
-    A user-supplied panel can be provided for validation against UserPanelModel;
-    otherwise, the panel embedded in the MIBI file is loaded and validated
-    against MibiFilePanelModel.
+    using cached properties or standard properties. Validates data structures
+    using Patito/Pydantic models. A user-supplied panel can be provided for
+    validation against UserPanelModel; otherwise, the panel embedded in the
+    MIBI file is loaded and validated against MibiFilePanelModel.
     """
 
     # --- Initialization & Context Management --- #
@@ -57,9 +71,37 @@ class MibiFile:
         file_path: PathLike,
         panel: pl.DataFrame | None = None,
         time_resolution: float | None = 500e-6,
-        num_chunks: int = 16,
+        num_chunks: int = 32,
         sparsity: bool = False,
     ):
+        """Initialize the MibiFile context manager.
+
+        Parameters
+        ----------
+        file_path
+            Path to the MIBI binary file.
+        panel
+            Optional user-supplied Polars DataFrame representing the panel.
+            If provided, it will be validated against `UserPanelModel`.
+            If None, the panel embedded in the MIBI file will be loaded and
+            validated against `MibiFilePanelModel`.
+        time_resolution
+            Optional time resolution override in microseconds (e.g., 500e-6).
+            If None, the value from the MIBI file's mass calibration will be used.
+        num_chunks
+            Number of chunks to divide the MIBI file into for parallel processing
+            by the Rust backend. (more is better, but after 64 there are diminishing returns).
+        sparsity
+            If True, indicates that the resulting xarray images should use
+            sparse arrays (e.g., `sparse.COO`). Defaults to False.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the specified `file_path` does not exist or is not a file.
+        pt.DataFrameValidationError
+            If the user-supplied `panel` fails validation against `UserPanelModel`.
+        """
         if (fp := UPath(file_path)).is_file():
             self.file_path = fp
         else:
@@ -67,22 +109,19 @@ class MibiFile:
 
         self.reader = MibiReader(self.file_path, num_chunks)
         self.num_chunks = num_chunks
-        self._data: pt.LazyFrame[MibiDataModel] | None = None
-        self._panel: pt.DataFrame[MibiFilePanelModel] | pt.DataFrame[UserPanelModel] | None = None
-        self._mass_calibration: MassCalibrationModel | None = None
-        self._loaded_data = False
-        self._time_resolution = time_resolution
+        self._time_resolution_override = time_resolution
         self.sparsity = sparsity
+        self._panel: pt.DataFrame[MibiFilePanelModel] | pt.DataFrame[UserPanelModel] | None = None
 
+        self._user_panel: pt.DataFrame[UserPanelModel] | None = None
         if panel is not None:
-            # Validate the user-provided panel immediately
             try:
-                self._panel = UserPanelModel.validate(panel)
-                print("User-supplied panel validated successfully.")
+                # Validate and store the user-provided panel immediately
+                self._user_panel = UserPanelModel.validate(panel)
+                logger.success("User-supplied panel validated successfully.")
             except (pt.DataFrameValidationError, Exception) as e:
-                print(f"User-supplied panel validation failed for file: {self.file_path}")
-                raise e  # Re-raise validation or other error
-        # Else: self._panel remains None, will be loaded from file later
+                logger.error(f"User-supplied panel validation failed for file: {self.file_path}: {e}")
+                raise e
 
     def __enter__(self):
         return self
@@ -91,84 +130,182 @@ class MibiFile:
         # Returning False (or omitting return) propagates exceptions
         pass
 
-    # --- Internal Data Loading --- #
+    # --- Core Data Properties (Cached or Standard) --- #
 
-    def _load_data_if_needed(self) -> None:
-        """Internal method to load and validate data using the Rust backend."""
-        if self._loaded_data:
-            return
-
-        try:
-            # 1. Get Metadata & Dimensions from Reader
-            (n_x_pixels, n_y_pixels) = self.reader.dimensions
-            mass_calibration_json = self.reader.mass_calibration_json
-            # Only get panel from reader if no user panel was provided
-            file_panel_df = self.reader.panel if self._panel is None else None
-
-            # Name of the FOV, run
-            self.fov_id = self.reader.fov_id
-            self.fov_name = self.reader.fov_name
-            self.run_name = self.reader.run_name
-            self.run_uuid = self.reader.run_uuid
-            self.fov_size_microns = self.reader.fov_size_microns
-            self.formatted_fov_name = format_image_name(self.fov_id, self.fov_name)
-
-            # 2. Validate Metadata
-            self._mass_calibration = MassCalibrationModel.model_validate_json(mass_calibration_json)
-
-            # Validate file panel if needed, otherwise confirm user panel
-            if self._panel is None and file_panel_df is not None:
-                self._panel = MibiFilePanelModel.validate(file_panel_df)
-            elif self._panel is not None:
-                # Assuming user panel was validated in __init__
-                print("(User Panel OK)", end=" ", flush=True)
-            else:
-                # Handle case where panel is None but shouldn't be?
-                print("Panel validation skipped/failed?", end=" ", flush=True)
-
-            # 3. Get & Validate Main Data
-            start_time = time.time()
-            raw_data_df: pl.DataFrame = self.reader.get_dataframe()
-            end_time = time.time()
-            print(f"({end_time - start_time:.5f}s)", end=" ", flush=True)
-            validated_data_df = MibiDataModel.validate(raw_data_df)
-            self._data = validated_data_df.lazy()
-
-            # 4. Set internal state
-            self._n_x_pixels = n_x_pixels
-            self._n_y_pixels = n_y_pixels
-            self._loaded_data = True
-
-        except (pt.DataFrameValidationError, Exception) as e:
-            # Reset state on error
-            self._data = None
-            self._mass_calibration = None
-            self._loaded_data = False
-            print(f"\nError loading/validating file {self.file_path}: {e}")
-            raise e
-
-    # --- Core Data Properties --- #
+    @cached_property
+    @_property_loader
+    def dimensions(self) -> tuple[int, int]:
+        """(Cached) Returns the (n_x_pixels, n_y_pixels) dimensions from the file."""
+        # Note: Rust returns width, height. MibiFile typically uses y, x internally.
+        width, height = self.reader.dimensions
+        return width, height
 
     @property
-    def data(self) -> pt.LazyFrame[MibiDataModel]:
-        """Lazily loads and returns the pixel data LazyFrame."""
-        self._load_data_if_needed()
-        assert self._data is not None
-        return self._data
+    def n_x_pixels(self) -> int:
+        """Returns the number of pixels in the x-dimension."""
+        return self.dimensions[0]
+
+    @property
+    def n_y_pixels(self) -> int:
+        """Returns the number of pixels in the y-dimension."""
+        return self.dimensions[1]
+
+    @cached_property
+    @_property_loader
+    def mass_calibration(self) -> MassCalibrationModel:
+        """(Cached) Loads and validates the mass calibration data."""
+        mass_calibration_json = self.reader.mass_calibration_json
+        return MassCalibrationModel.model_validate_json(mass_calibration_json)
+
+    @property
+    def time_resolution(self) -> float:
+        """Returns the time resolution (override or from mass calibration)."""
+        return self._time_resolution_override or self.mass_calibration.time_resolution
+
+    @cached_property
+    @_property_loader
+    def fov_id(self) -> str:
+        """(Cached) Returns the FOV ID."""
+        return self.reader.fov_id
+
+    @cached_property
+    @_property_loader
+    def fov_name(self) -> str:
+        """(Cached) Returns the FOV name."""
+        return self.reader.fov_name
+
+    @cached_property
+    @_property_loader
+    def run_name(self) -> str:
+        """(Cached) Returns the run name."""
+        return self.reader.run_name
+
+    @cached_property
+    @_property_loader
+    def run_uuid(self) -> str:
+        """(Cached) Returns the run UUID."""
+        return self.reader.run_uuid
+
+    @cached_property
+    @_property_loader
+    def fov_size_microns(self) -> float:
+        """(Cached) Returns the FOV size in microns."""
+        return self.reader.fov_size_microns
+
+    # --- Newly Added Instrument/Acquisition Properties --- #
+
+    @cached_property
+    @_property_loader
+    def instrument_identifier(self) -> str:
+        """(Cached) Returns the instrument identifier string."""
+        return self.reader.instrument_identifier
+
+    @cached_property
+    @_property_loader
+    def instrument_control_version(self) -> str:
+        """(Cached) Returns the instrument control software version string."""
+        return self.reader.instrument_control_version
+
+    @cached_property
+    @_property_loader
+    def tof_app_version(self) -> str:
+        """(Cached) Returns the TOF application version string."""
+        return self.reader.tof_app_version
+
+    @cached_property
+    @_property_loader
+    def dwell_time_millis(self) -> float:
+        """(Cached) Returns the dwell time per pixel in milliseconds."""
+        return self.reader.dwell_time_millis
+
+    @cached_property
+    @_property_loader
+    def acquisition_status(self) -> str:
+        """(Cached) Returns the acquisition status string."""
+        return self.reader.acquisition_status
+
+    @cached_property
+    @_property_loader
+    def scan_count(self) -> int:
+        """(Cached) Returns the number of scans performed for the FOV."""
+        return self.reader.scan_count
+
+    @cached_property
+    @_property_loader
+    def imaging_preset_name(self) -> str:
+        """(Cached) Returns the name of the imaging preset used."""
+        return self.reader.imaging_preset_name
+
+    @cached_property
+    @_property_loader
+    def imaging_aperture(self) -> str:
+        """(Cached) Returns the imaging aperture setting used."""
+        return self.reader.imaging_aperture
+
+    @cached_property
+    @_property_loader
+    def acquisition_start_timestamp(self) -> int:
+        """(Cached) Returns the acquisition start timestamp (likely Unix epoch milliseconds)."""
+        return self.reader.acquisition_start_timestamp
+
+    @cached_property
+    @_property_loader
+    def acquisition_end_timestamp(self) -> int:
+        """(Cached) Returns the acquisition end timestamp (likely Unix epoch milliseconds)."""
+        return self.reader.acquisition_end_timestamp
+
+    # --- Formatting Properties --- #
+
+    @cached_property
+    def formatted_fov_name(self) -> str:
+        """(Cached) Returns the formatted FOV name (e.g., 'fov-1-R13C3')."""
+        return format_image_name(self.fov_id, self.fov_name)
+
+    @cached_property
+    def formatted_run_name(self) -> str:
+        """(Cached) Returns the formatted run name (e.g., '2022-07-04_NBL_TMA2')."""
+        return format_run_name(self.run_name)
 
     @property
     def panel(self) -> pt.DataFrame[MibiFilePanelModel] | pt.DataFrame[UserPanelModel]:
-        """Returns the panel DataFrame (user-supplied or from file)."""
-        self._load_data_if_needed()
-        assert self._panel is not None
+        """
+        Returns the panel DataFrame.
+
+        Loads from file and validates on first access if not provided by the user.
+        Returns the panel with TOF ranges if `add_tof_ranges_to_panel` has been called.
+        """
+        if self._panel is None:
+            if self._user_panel is not None:
+                self._panel = self._user_panel
+            else:
+                try:
+                    file_panel_df = self.reader.panel
+                    if file_panel_df is None:
+                        raise ValueError("Could not load panel from MIBI file.")
+                    self._panel = MibiFilePanelModel.validate(file_panel_df)
+                except (pt.DataFrameValidationError, Exception) as e:
+                    logger.error(f"Error loading/validating panel from file {self.file_path}: {e}")
+                    raise e
+
+        # If _panel somehow still None, raise error (shouldn't happen with checks above)
+        if self._panel is None:
+            raise AttributeError("Panel could not be loaded or validated.")
+
         return self._panel
 
-    @property
-    def mass_calibration(self) -> MassCalibrationModel:
-        """Returns the validated mass calibration data."""
-        self._load_data_if_needed()
-        assert self._mass_calibration is not None
-        return self._mass_calibration
+    @cached_property
+    @_property_loader
+    def data(self) -> pt.LazyFrame[MibiDataModel]:
+        """(Cached) Lazily loads and returns the validated pulse data LazyFrame."""
+        import time
+
+        start_time = time.time()
+        raw_data_df: pl.DataFrame = self.reader.get_dataframe()
+        end_time = time.time()
+        print(f"Time taken to read data: {end_time - start_time} seconds")
+        # Validate the raw data against the MibiDataModel
+        validated_data_df = MibiDataModel.validate(raw_data_df)
+        return validated_data_df.lazy()
 
     # --- Panel Operations --- #
 
@@ -176,40 +313,40 @@ class MibiFile:
         """
         Adds lower and upper time-of-flight (TOF) range columns to the panel.
 
-        Uses the mass calibration parameters associated with this MIBI file
-        to calculate TOF ranges based on the 'mass_start' and 'mass_stop'
-        columns in the panel.
-
-        Returns
-        -------
-            A new Polars DataFrame derived from the instance's panel, with
-            'lower_tof_range' (UInt16) and 'upper_tof_range' (UInt16) added.
+        Calculates TOF ranges based on the 'mass_start' and 'mass_stop'
+        columns using the file's mass calibration. Modifies the internal panel
+        state, so subsequent accesses to `self.panel` will include these columns.
 
         Raises
         ------
             ValueError: If the panel DataFrame lacks 'mass_start' or 'mass_stop'.
-            AttributeError: If data hasn't been loaded successfully.
+            AttributeError: If mass calibration data cannot be loaded.
         """
-        self._load_data_if_needed()
-        if self._panel is None or self._mass_calibration is None:
-            raise AttributeError("Panel or mass calibration data not loaded.")
+        # Access properties to ensure they are loaded
+        current_panel = self.panel
+        mc = self.mass_calibration
+        tr = self.time_resolution  # Uses override or mc value
 
-        self._panel = MibiFilePanelModel.validate(
-            _set_tof_ranges(
-                panel=self.panel,
-                mass_offset=self.mass_calibration.mass_offset,
-                mass_gain=self.mass_calibration.mass_gain,
-                time_resolution=self._time_resolution or self.mass_calibration.time_resolution,
-            ),
-            allow_superfluous_columns=True,
+        panel_with_ranges = _set_tof_ranges(
+            panel=current_panel,  # Use the currently loaded panel
+            mass_offset=mc.mass_offset,
+            mass_gain=mc.mass_gain,
+            time_resolution=tr,
         )
 
+        validation_model = UserPanelModel if self._user_panel is not None else MibiFilePanelModel
+        try:
+            self._panel = validation_model.validate(panel_with_ranges, allow_superfluous_columns=True)
+        except (pt.DataFrameValidationError, Exception) as e:
+            logger.error(f"Error validating panel after adding TOF ranges: {e}")
+            raise e
+
     def get_channel_info(self, channel_name: str) -> pl.DataFrame | None:
-        """Example: Get panel info for a specific channel using the 'target' column."""
+        """Get panel info for a specific channel using the 'target' column."""
         try:
             return self.panel.filter(pl.col("target") == channel_name)
-        except (pt.DataFrameValidationError, Exception) as e:
-            print(f"Error filtering panel for channel '{channel_name}': {e}")
+        except pl.exceptions.PolarsError as e:
+            logger.error(f"Error filtering panel for channel '{channel_name}': {e}")
             return None
 
     # --- Image Generation --- #
@@ -220,109 +357,126 @@ class MibiFile:
         output_dtype: type,
         required_data_cols: list[str],
         result_col_alias: str,
-        log_suffix: str,
+        name_suffix: str,
     ) -> xr.DataArray:
         """Internal helper to generate multichannel images based on an aggregation."""
-        self._load_data_if_needed()
+        # Access properties to trigger loading if needed
+        current_panel = self.panel
+        pulse_data = self.data
+        fov_microns = self.fov_size_microns
+        nx = self.n_x_pixels
+        ny = self.n_y_pixels
+        fov_fmt_name = self.formatted_fov_name
 
-        if self._panel is None or self._data is None:
-            raise AttributeError("Panel or data not loaded or is missing.")
-
-        if "lower_tof_range" not in self.panel.columns or "upper_tof_range" not in self.panel.columns:
-            print("TOF ranges not found in panel, calculating now...")
+        # Check if TOF ranges are present, add them if not
+        if "lower_tof_range" not in current_panel.columns or "upper_tof_range" not in current_panel.columns:
             self.add_tof_ranges_to_panel()
+            current_panel = self.panel  # Re-access panel to get the updated version
 
-        channel_col = "target" if "target" in self.panel.columns else "channel_name"
-        if channel_col not in self.panel.columns:
+        channel_col = "target" if "target" in current_panel.columns else "channel_name"
+        if channel_col not in current_panel.columns:
             raise AttributeError("Panel missing channel identifier column ('target' or 'channel_name').")
 
-        # Prepare panel
-        panel_to_iterate = self.panel.select(channel_col, "lower_tof_range", "upper_tof_range")
-        channel_names = panel_to_iterate.select(channel_col).to_series().to_list()
+        # Group panel by TOF ranges and aggregate channel names
+        grouped_panel = (
+            current_panel.select(channel_col, "lower_tof_range", "upper_tof_range")
+            .group_by(["lower_tof_range", "upper_tof_range"])
+            .agg(pl.col(channel_col).sort().str.join("_").alias("grouped_channel_name"))
+            .sort("lower_tof_range")
+        )
 
-        # Prepare output structure - Initialized before the loop
-        output_images: dict[str, NDArray] = {
-            name: np.zeros((self._n_y_pixels, self._n_x_pixels), dtype=output_dtype) for name in channel_names
-        }
+        # Prepare output structure
+        channel_names = grouped_panel.get_column("grouped_channel_name").to_list()
+        output_images: dict[str, NDArray] = {name: np.zeros((ny, nx), dtype=output_dtype) for name in channel_names}
 
-        for row in tqdm(panel_to_iterate.sort(channel_col).iter_rows(named=True), total=len(panel_to_iterate)):
-            channel_name = row[channel_col]
+        for row in tqdm(
+            grouped_panel.iter_rows(named=True),
+            total=len(grouped_panel),
+            desc=f"Generating {name_suffix} image",
+            unit="group",
+        ):
+            grouped_channel_name = row["grouped_channel_name"]
             lower_tof = row["lower_tof_range"]
             upper_tof = row["upper_tof_range"]
 
-            # Filter data for the current channel, select necessary columns and aggregate *only* for this channel
+            # Filter data for the current TOF range group
+            # Use the 'pulse_data' property which returns the LazyFrame
             pixel_aggregated_channel = (
-                self.data.filter(pl.col("pulse_time").is_between(lower_tof, upper_tof, closed="both"))
+                pulse_data.filter(pl.col("pulse_time").is_between(lower_tof, upper_tof, closed="both"))
                 .select(["pixel_y", "pixel_x"] + required_data_cols)
                 .group_by(["pixel_y", "pixel_x"])
                 .agg(aggregation_expr)
                 .collect()
             )
 
-            # Populate the NumPy array for this channel
-            if not pixel_aggregated_channel.is_empty():
-                y_coords: NDArray = pixel_aggregated_channel.get_column("pixel_y").to_numpy(allow_copy=False)
-                x_coords: NDArray = pixel_aggregated_channel.get_column("pixel_x").to_numpy(allow_copy=False)
-                values: NDArray = pixel_aggregated_channel.get_column(result_col_alias).to_numpy(allow_copy=False)
-                output_images[channel_name][y_coords, x_coords] = values
+            # Populate the NumPy array for this channel group
+            y_coords: NDArray = pixel_aggregated_channel.get_column("pixel_y").to_numpy(allow_copy=False)
+            x_coords: NDArray = pixel_aggregated_channel.get_column("pixel_x").to_numpy(allow_copy=False)
+            values: NDArray = pixel_aggregated_channel.get_column(result_col_alias).to_numpy(allow_copy=False)
+            output_images[grouped_channel_name][y_coords, x_coords] = values
 
         img_xr = to_xarray(
             output_images,
-            name=format_image_name(self.fov_id, self.fov_name),
+            name=f"{fov_fmt_name}_{name_suffix}",
             sparsity=self.sparsity,
             scale={
                 C: 1,
-                X: self.fov_size_microns / self._n_x_pixels,
-                Y: self.fov_size_microns / self._n_y_pixels,
+                X: fov_microns / nx,
+                Y: fov_microns / ny,
             },
         )
         return img_xr
 
+    # --- Image Properties (remain cached) --- #
+
     @cached_property
     def counts_image(self) -> xr.DataArray:
-        """Returns the counts image (computed on first access)."""
+        """(Cached) Returns the counts image."""
         return self._generate_channel_images(
             aggregation_expr=pl.count().alias("counts"),
             output_dtype=ndt.UInt32,
             required_data_cols=[],
             result_col_alias="counts",
-            log_suffix="count images",
+            name_suffix="counts",
         )
 
     @cached_property
     def intensity_image(self) -> xr.DataArray:
-        """Returns the intensity image (computed on first access)."""
+        """(Cached) Returns the intensity image."""
         return self._generate_channel_images(
             aggregation_expr=pl.sum("pulse_intensity").alias("sum_intensity"),
             output_dtype=ndt.Int64,
             required_data_cols=["pulse_intensity"],
             result_col_alias="sum_intensity",
-            log_suffix="intensity images",
+            name_suffix="intensity",
         )
 
     @cached_property
     def intensity_width_image(self) -> xr.DataArray:
-        """Returns the intensity*width image (computed on first access)."""
+        """(Cached) Returns the intensity*width image."""
         return self._generate_channel_images(
             aggregation_expr=(pl.col("pulse_intensity") * pl.col("pulse_width")).sum().alias("sum_intensity_width"),
             output_dtype=ndt.Int64,
             required_data_cols=["pulse_intensity", "pulse_width"],
             result_col_alias="sum_intensity_width",
-            log_suffix="intensity*width images",
+            name_suffix="intensity_width",
         )
 
     # --- Data Export --- #
 
     def write_data(self, file_path: PathLike, **kwargs: Unpack[WriteParquetKwargs]) -> None:
         """Writes the raw pulse data (LazyFrame) to a Parquet file."""
-        self._load_data_if_needed()
         output_path = UPath(file_path)
+        # Access self.data property to trigger loading/validation if not already done
         self.data.collect().write_parquet(output_path, **kwargs)
 
     def _configure_zarr(self):
         """Sets the global zarr configuration for optimized writing."""
-        import zarr
-        import zarrs  # noqa: F401
+        try:
+            import zarr
+            import zarrs  # noqa: F401
+        except ImportError as e:
+            raise ImportError("zarr and zarrs are required for Zarr/NGFF writing. Install them with mbt[zarr]") from e
 
         zarr.config.set(
             {
@@ -339,79 +493,108 @@ class MibiFile:
             }
         )
 
-    def write_dataset_to_zarr(self, store: StoreLike):
-        """Convert the generated image DataArrays to a Dataset and write to a Zarr store."""
+    def write_dataset_to_zarr(
+        self,
+        output_directory: PathLike,
+    ):
+        """Write the generated image DataArrays to an Xarray Dataset Zarr store."""
         self._configure_zarr()
-        import xarray as xr
+
+        # Access properties to trigger generation/loading
+        counts = self.counts_image
+        intensity = self.intensity_image
+        intensity_width = self.intensity_width_image
+        run_fmt_name = self.formatted_run_name
+        fov_fmt_name = self.formatted_fov_name
+
+        out_dir = UPath(output_directory) / run_fmt_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output_path = out_dir / f"{fov_fmt_name}.zarr"
+        print(f"(Writing Dataset to Zarr: {output_path})", end=" ", flush=True)
 
         xr.Dataset(
             data_vars={
-                "counts": self.counts_image,
-                "intensity": self.intensity_image,
-                "intensity_width": self.intensity_width_image,
+                "counts": counts,
+                "intensity": intensity,
+                "intensity_width": intensity_width,
             },
-            coords={
-                C: self.counts_image.coords[C].to_list(),
-                X: self.counts_image.coords[X].to_list(),
-                Y: self.counts_image.coords[Y].to_list(),
-            },
-        ).to_zarr(store, consolidated=True)  # type: ignore
+            coords=counts.coords,
+        ).to_zarr(output_path, consolidated=True, mode="w")
+        logger.info("Dataset Zarr written.")
 
     def write_ome_zarr(
-        self, output_directory: PathLike, image_type: list[Literal["counts", "intensity", "intensity_width"]]
+        self,
+        output_directory: PathLike,
+        image_type: list[Literal["counts", "intensity", "intensity_width"]] | str | list[str] | None = None,
     ):
-        """
-        Write specified image types to individual OME-Zarr stores in a directory.
+        """Write specified image types to individual OME-Zarr stores."""
+        self._configure_zarr()
+        # Access properties needed for metadata/scaling
+        run_fmt_name = self.formatted_run_name
+        fov_fmt_name = self.formatted_fov_name
+        fov_microns = self.fov_size_microns
+        ny = self.n_y_pixels
+        nx = self.n_x_pixels
 
-        Args:
-            output_directory: The directory where the OME-Zarr stores will be created.
-            image_type: A list of image types to write (e.g., ["counts", "intensity"]).
-                      Valid types are "counts", "intensity", "intensity_width".
-        """
-        self._configure_zarr()  # Call helper method
-        self._load_data_if_needed()  # Ensure data/dims are loaded
+        try:
+            from ngff_zarr import to_multiscales, to_ngff_image, to_ngff_zarr
+        except ImportError as e:
+            raise ImportError("ngff-zarr is required for OME-Zarr writing. Install with mbt[zarr]") from e
 
-        from ngff_zarr import to_multiscales, to_ngff_image, to_ngff_zarr
-
-        # Create the output directory if it doesn't exist
-        out_dir = UPath(output_directory)
+        out_dir = UPath(output_directory) / run_fmt_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Map image type names to their corresponding DataArray properties
-        image_map = {
-            "counts": self.counts_image,
-            "intensity": self.intensity_image,
-            "intensity_width": self.intensity_width_image,
-        }
+        if image_type is None:
+            image_type = ["counts", "intensity", "intensity_width"]
+        if isinstance(image_type, str):
+            image_type = [image_type]
+
+        # Validate requested types
+        valid_types = {"counts", "intensity", "intensity_width"}
+        requested_types = set(image_type)
+        if not requested_types.issubset(valid_types):
+            invalid = requested_types - valid_types
+            raise ValueError(f"Invalid image_type requested: {invalid}. Valid types are: {valid_types}")
 
         for img_type in image_type:
-            img_data = image_map[img_type]
-            run_dir = out_dir / self.run_name
-            run_dir.mkdir(parents=True, exist_ok=True)
-
-            output_path = run_dir / f"{self.reader.fov_name}-{img_type}.ome.zarr"
+            img_data = getattr(self, f"{img_type}_image")
+            output_path = out_dir / f"{fov_fmt_name}-{img_type}.ome.zarr"
 
             ngff_image = to_ngff_image(
                 data=img_data,
-                dims=[C, X, Y],
+                dims=[C, Y, X],
                 scale={
                     C: 1,
-                    Y: self.fov_size_microns / self._n_y_pixels,
-                    X: self.fov_size_microns / self._n_x_pixels,
+                    Y: fov_microns / ny,
+                    X: fov_microns / nx,
                 },
                 translation=None,
-                name=f"{self.reader.fov_name}_{img_type}",  # Use specific name
-                axes_units={X: "micrometer", Y: "micrometer"},  # Assuming micrometer
-            )
-            multiscales = to_multiscales(
-                ngff_image,
-                scale_factors=[{Y: 1, X: 1}],
-                chunks={C: 1, X: self._n_x_pixels, Y: self._n_y_pixels},
+                name=f"{self.formatted_fov_name}_{img_type}",
+                axes_units={X: "micrometer", Y: "micrometer"},
             )
 
-            # Write the specific image to its own zarr store
-            to_ngff_zarr(
-                str(output_path),
-                multiscales=multiscales,
-                consolidated=True,
+            scale_factors = [{"y": 2, "x": 2}] * 1
+
+            base_chunk_y = min(ny, 256)
+            base_chunk_x = min(nx, 256)
+            chunks = {C: 1, Y: base_chunk_y, X: base_chunk_x}
+
+            multiscales = to_multiscales(
+                ngff_image,
+                scale_factors=scale_factors,
+                chunks=chunks,
             )
+
+            to_ngff_zarr(
+                output_path,
+                multiscales=multiscales,
+                overwrite=True,
+            )
+
+    def write_tifffile(self, ome: bool = False, output_directory: PathLike | None = None):
+        """Write the generated image DataArrays to a TIFF file."""
+        raise NotImplementedError("TIFF writing is not yet implemented.")
+
+    def to_spatialdata(self):
+        """Convert the MibiFile Images to a SpatialData object."""
+        raise NotImplementedError("SpatialData export is not yet implemented.")

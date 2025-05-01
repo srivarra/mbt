@@ -77,6 +77,56 @@ class MibiReader:
         """Returns the run UUID."""
         ...
 
+    @property
+    def instrument_identifier(self) -> str:
+        """Returns the instrument identifier string."""
+        ...
+
+    @property
+    def instrument_control_version(self) -> str:
+        """Returns the instrument control software version string."""
+        ...
+
+    @property
+    def tof_app_version(self) -> str:
+        """Returns the TOF application version string."""
+        ...
+
+    @property
+    def dwell_time_millis(self) -> float:
+        """Returns the dwell time per pixel in milliseconds."""
+        ...
+
+    @property
+    def acquisition_status(self) -> str:
+        """Returns the acquisition status string."""
+        ...
+
+    @property
+    def scan_count(self) -> int:
+        """Returns the number of scans performed for the FOV."""
+        ...
+
+    @property
+    def imaging_preset_name(self) -> str:
+        """Returns the name of the imaging preset used."""
+        ...
+
+    @property
+    def imaging_aperture(self) -> str:
+        """Returns the imaging aperture setting used."""
+        ...
+
+    @property
+    def acquisition_start_timestamp(self) -> int:
+        """Returns the acquisition start timestamp (likely Unix epoch milliseconds)."""
+        ...
+
+    @property
+    def acquisition_end_timestamp(self) -> int:
+        """Returns the acquisition end timestamp (likely Unix epoch milliseconds)."""
+        ...
+
     def get_dataframe(self) -> pl.DataFrame:
         """Parses and returns the full pixel data as a Polars DataFrame.
 

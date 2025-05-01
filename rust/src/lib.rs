@@ -123,6 +123,99 @@ impl MibiReader {
         })
     }
 
+    #[getter]
+    fn instrument_identifier(&self) -> PyResult<String> {
+        self.mibi_file
+            .descriptor
+            .instrument_identifier
+            .clone()
+            .ok_or_else(|| PyValueError::new_err("Instrument identifier not found in descriptor"))
+    }
+
+    #[getter]
+    fn instrument_control_version(&self) -> PyResult<String> {
+        self.mibi_file
+            .descriptor
+            .instrument_control_version
+            .clone()
+            .ok_or_else(|| {
+                PyValueError::new_err("Instrument control version not found in descriptor")
+            })
+    }
+
+    #[getter]
+    fn tof_app_version(&self) -> PyResult<String> {
+        self.mibi_file
+            .descriptor
+            .tof_app_version
+            .clone()
+            .ok_or_else(|| PyValueError::new_err("TOF app version not found in descriptor"))
+    }
+
+    #[getter]
+    fn dwell_time_millis(&self) -> PyResult<f64> {
+        // Prefer fov.dwell_time_millis if available, otherwise top-level
+        self.mibi_file.descriptor.fov.as_ref().and_then(|fov| fov.dwell_time_millis)
+            .or(self.mibi_file.descriptor.dwell_time_millis)
+            .ok_or_else(|| PyValueError::new_err("Dwell time (ms) not found in descriptor"))
+    }
+
+    #[getter]
+    fn acquisition_status(&self) -> PyResult<String> {
+        self.mibi_file
+            .descriptor
+            .acquisition_status
+            .clone()
+            .ok_or_else(|| PyValueError::new_err("Acquisition status not found in descriptor"))
+    }
+
+    #[getter]
+    fn scan_count(&self) -> PyResult<i32> {
+        self.mibi_file
+            .descriptor
+            .fov.as_ref()
+            .and_then(|fov| fov.scan_count)
+            .ok_or_else(|| PyValueError::new_err("Scan count not found in descriptor (fov.scan_count)"))
+    }
+
+    #[getter]
+    fn imaging_preset_name(&self) -> PyResult<String> {
+        self.mibi_file
+            .descriptor
+            .fov.as_ref()
+            .and_then(|fov| fov.imaging_preset.as_ref())
+            .and_then(|preset| preset.preset.clone())
+            .ok_or_else(|| PyValueError::new_err("Imaging preset name not found in descriptor (fov.imaging_preset.preset)"))
+    }
+
+    #[getter]
+    fn imaging_aperture(&self) -> PyResult<String> {
+        self.mibi_file
+            .descriptor
+            .fov.as_ref()
+            .and_then(|fov| fov.imaging_preset.as_ref())
+            .and_then(|preset| preset.aperture.clone())
+             // Fallback to gun.aperture if fov preset aperture is missing
+            .or_else(|| self.mibi_file.descriptor.gun.as_ref().and_then(|gun| gun.aperture.clone()))
+            .ok_or_else(|| PyValueError::new_err("Imaging aperture not found in descriptor (fov.imaging_preset.aperture or gun.aperture)"))
+    }
+
+    #[getter]
+    fn acquisition_start_timestamp(&self) -> PyResult<i64> {
+        self.mibi_file
+            .descriptor
+            .acquisition_start
+            .ok_or_else(|| PyValueError::new_err("Acquisition start timestamp not found in descriptor"))
+    }
+
+    #[getter]
+    fn acquisition_end_timestamp(&self) -> PyResult<i64> {
+         self.mibi_file
+            .descriptor
+            .acquisition_end
+            .ok_or_else(|| PyValueError::new_err("Acquisition end timestamp not found in descriptor"))
+    }
+
     fn get_dataframe(&mut self) -> PyResult<PyDataFrame> {
         if let Some(ref df) = self.dataframe {
             Ok(PyDataFrame(df.clone()))
