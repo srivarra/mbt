@@ -1,3 +1,5 @@
+import re
+
 import polars as pl
 
 
@@ -75,3 +77,22 @@ def _set_tof_ranges(panel: pl.DataFrame, mass_offset: float, mass_gain: float, t
         ),
     )
     return updated_panel
+
+
+def format_image_name(fov_id: str, fov_name: str) -> str:
+    """Formats an image name string from FOV ID and FOV name.
+
+    Transforms FOV IDs like 'FOV1', 'fov23' into 'fov-1', 'fov-23'.
+    Combines the formatted FOV ID with the FOV name.
+
+    Args:
+        fov_id: The field of view identifier (e.g., 'FOV1').
+        fov_name: The field of view name (e.g., 'R13C3').
+
+    Returns
+    -------
+        A formatted string (e.g., 'fov-1-R13C3').
+    """
+    match = re.match(r"fov(\d+)", fov_id, re.IGNORECASE)
+    formatted_fov_id = f"fov-{match.group(1)}" if match else fov_id.lower()
+    return f"{formatted_fov_id}-{fov_name}"

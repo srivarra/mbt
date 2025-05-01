@@ -4,6 +4,10 @@ import patito as pt
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field
 
+C = "c"
+X = "x"
+Y = "y"
+
 
 class MibiDataModel(pt.Model):
     """Patito model for validating the core MIBI pixel data DataFrame."""

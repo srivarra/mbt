@@ -2,25 +2,93 @@ from os import PathLike
 
 import polars as pl
 
-def hello_world() -> str: ...
-def parse_mibi_file_to_py_df(
-    file_path: PathLike, num_chunks: int
-) -> tuple[pl.DataFrame, pl.DataFrame, str, tuple[int, int]]:
-    """Parse the MIBI binary file into two Polars DataFrames: one for pixel data and one for panel information.
+class MibiReader:
+    """A class to read and access data from MIBI binary files.
 
-    Parameters
-    ----------
-    file_path
-        The path to the MIBI binary file.
-    num_chunks
-        The number of chunks to use for parallel processing.
-
-    Returns
-    -------
-        A tuple containing two Polars DataFrames:
-        - The first DataFrame contains the pixel data.
-        - The second DataFrame contains the panel information.
-        - The third string contains the mass calibration data.
-        - The fourth tuple contains the size of the image.
+    This class is implemented in Rust and provides an interface to interact
+    with MIBI file data, including metadata and pixel data.
     """
-    ...
+
+    def __init__(self, file_path: PathLike, num_chunks: int = 16):
+        """Initializes the MibiReader by opening the specified MIBI file.
+
+        Args:
+            file_path: The path to the MIBI binary file (.bin).
+            num_chunks: The number of chunks to use for parallel processing
+                        when parsing the full image data.
+
+        Raises
+        ------
+            FileNotFoundError: If the file cannot be found or opened.
+            ValueError: If the file path is invalid or for other file access issues.
+        """
+        ...
+
+    @property
+    def panel(self) -> pl.DataFrame:
+        """Returns the panel information DataFrame.
+
+        This DataFrame is typically loaded when the file is opened.
+        """
+        ...
+
+    @property
+    def mass_calibration_json(self) -> str:
+        """Returns the mass calibration data as a JSON string.
+
+        Raises
+        ------
+            ValueError: If mass calibration data is not found or cannot be serialized.
+        """
+        ...
+
+    @property
+    def dimensions(self) -> tuple[int, int]:
+        """Returns the image dimensions (width, height) in pixels.
+
+        Returns
+        -------
+            A tuple (width, height).
+        """
+        ...
+
+    @property
+    def fov_size_microns(self) -> float:
+        """Returns the field of view size in microns."""
+        ...
+
+    @property
+    def fov_id(self) -> str:
+        """Returns the field of view ID."""
+        ...
+
+    @property
+    def fov_name(self) -> str:
+        """Returns the field of view name."""
+        ...
+
+    @property
+    def run_name(self) -> str:
+        """Returns the run name."""
+        ...
+
+    @property
+    def run_uuid(self) -> str:
+        """Returns the run UUID."""
+        ...
+
+    def get_dataframe(self) -> pl.DataFrame:
+        """Parses and returns the full pixel data as a Polars DataFrame.
+
+        The DataFrame is cached after the first call. Subsequent calls return
+        the cached DataFrame.
+
+        Returns
+        -------
+            A Polars DataFrame containing the pixel data.
+
+        Raises
+        ------
+            ValueError: If pixel data parsing fails.
+        """
+        ...

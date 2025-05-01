@@ -1,3 +1,5 @@
+from collections.abc import Hashable, Mapping
+
 import dask.array as da
 import natsort as ns
 import numpy as np
@@ -7,7 +9,12 @@ from numpydantic import NDArray
 from spatial_image import default_name, to_spatial_image
 
 
-def to_xarray(img_data: dict[str, NDArray], name: str | None = None, sparsity: bool = False) -> xr.DataArray:
+def to_xarray(
+    img_data: dict[str, NDArray],
+    name: str | None = None,
+    sparsity: bool = False,
+    scale: Mapping[Hashable, float] | None = None,
+) -> xr.DataArray:
     """Convert a dictionary of channel images to an xarray DataArray.
 
     Parameters
@@ -18,6 +25,8 @@ def to_xarray(img_data: dict[str, NDArray], name: str | None = None, sparsity: b
         The name of the xarray DataArray, by default None.
     sparsity, optional
         Whether to use sparse storage, by default False.
+    scale, optional
+        A dictionary of scale factors for the xarray DataArray, by default None.
 
     Returns
     -------
@@ -34,6 +43,9 @@ def to_xarray(img_data: dict[str, NDArray], name: str | None = None, sparsity: b
     return to_spatial_image(
         array_like=data,
         dims=("c", "y", "x"),
+        scale=scale,
+        axis_names={"c": "channel", "y": "y-axis", "x": "x-axis"},
+        axis_units={"c": "channel", "y": "micrometers", "x": "micrometers"},
         c_coords=channel_names,
         name=name or default_name,
     )

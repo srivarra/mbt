@@ -1,18 +1,42 @@
 import time
-from collections.abc import Mapping
+from collections.abc import Sequence
+from functools import cached_property
 from os import PathLike
-from pathlib import Path
+from typing import Any, Literal, TypedDict, Unpack
 
 import numpy as np
+import numpydantic.dtype as ndt
 import patito as pt
 import polars as pl
 import xarray as xr
 from numpydantic import NDArray
+from polars._typing import ParquetCompression
+from polars.io.cloud.credential_provider._providers import CredentialProviderFunction
+from tqdm.auto import tqdm
+from upath import UPath
+from zarr.storage import StoreLike
 
-from mbt._core import parse_mibi_file_to_py_df
-from mbt.core.models import MassCalibrationModel, MibiDataModel, MibiFilePanelModel, UserPanelModel
-from mbt.core.utils import _set_tof_ranges
+from mbt._core import MibiReader
+from mbt.core.models import C, MassCalibrationModel, MibiDataModel, MibiFilePanelModel, UserPanelModel, X, Y
+from mbt.core.utils import _set_tof_ranges, format_image_name
 from mbt.im import to_xarray
+
+
+class WriteParquetKwargs(TypedDict):
+    """Parameters for writing Parquet files."""
+
+    compression: ParquetCompression
+    compression_level: int | None
+    statistics: bool | str | dict[str, bool]
+    row_group_size: int | None
+    data_page_size: int | None
+    use_pyarrow: bool
+    pyarrow_options: dict[str, Any]
+    partition_by: str | Sequence[str]
+    partition_chunk_size_bytes: int
+    storage_options: dict[str, Any]
+    credential_provider: CredentialProviderFunction | Literal["auto"] | None
+    retries: int
 
 
 class MibiFile:
@@ -26,23 +50,29 @@ class MibiFile:
     against MibiFilePanelModel.
     """
 
+    # --- Initialization & Context Management --- #
+
     def __init__(
         self,
         file_path: PathLike,
         panel: pl.DataFrame | None = None,
         time_resolution: float | None = 500e-6,
         num_chunks: int = 16,
+        sparsity: bool = False,
     ):
-        self.file_path = Path(file_path)
-        if not self.file_path.is_file():
-            raise FileNotFoundError(f"MIBI file not found: {self.file_path}")
+        if (fp := UPath(file_path)).is_file():
+            self.file_path = fp
+        else:
+            raise FileNotFoundError(f"MIBI file not found: {fp}")
 
+        self.reader = MibiReader(self.file_path, num_chunks)
         self.num_chunks = num_chunks
-        self._data: pl.LazyFrame | None = None
+        self._data: pt.LazyFrame[MibiDataModel] | None = None
         self._panel: pt.DataFrame[MibiFilePanelModel] | pt.DataFrame[UserPanelModel] | None = None
         self._mass_calibration: MassCalibrationModel | None = None
-        self._loaded_data: bool = False
+        self._loaded_data = False
         self._time_resolution = time_resolution
+        self.sparsity = sparsity
 
         if panel is not None:
             # Validate the user-provided panel immediately
@@ -61,52 +91,66 @@ class MibiFile:
         # Returning False (or omitting return) propagates exceptions
         pass
 
+    # --- Internal Data Loading --- #
+
     def _load_data_if_needed(self) -> None:
         """Internal method to load and validate data using the Rust backend."""
         if self._loaded_data:
             return
 
         try:
-            print(f"Parsing MIBI file {self.file_path}...", end=" ", flush=True)
-            # 1. Call Rust function: returns data, embedded panel, mass cal JSON
-            raw_data_df, file_panel_df, mass_calibration_json, (size_x_pixels, size_y_pixels) = (
-                parse_mibi_file_to_py_df(
-                    file_path=self.file_path,
-                    num_chunks=self.num_chunks,
-                )
-            )
-            self._size_x_pixels = size_x_pixels
-            self._size_y_pixels = size_y_pixels
+            # 1. Get Metadata & Dimensions from Reader
+            (n_x_pixels, n_y_pixels) = self.reader.dimensions
+            mass_calibration_json = self.reader.mass_calibration_json
+            # Only get panel from reader if no user panel was provided
+            file_panel_df = self.reader.panel if self._panel is None else None
 
-            # 2. Validate Mass Calibration
+            # Name of the FOV, run
+            self.fov_id = self.reader.fov_id
+            self.fov_name = self.reader.fov_name
+            self.run_name = self.reader.run_name
+            self.run_uuid = self.reader.run_uuid
+            self.fov_size_microns = self.reader.fov_size_microns
+            self.formatted_fov_name = format_image_name(self.fov_id, self.fov_name)
+
+            # 2. Validate Metadata
             self._mass_calibration = MassCalibrationModel.model_validate_json(mass_calibration_json)
-            print("(Mass Cal OK)", end=" ", flush=True)
 
-            # 3. Validate MIBI Data (Optional)
+            # Validate file panel if needed, otherwise confirm user panel
+            if self._panel is None and file_panel_df is not None:
+                self._panel = MibiFilePanelModel.validate(file_panel_df)
+            elif self._panel is not None:
+                # Assuming user panel was validated in __init__
+                print("(User Panel OK)", end=" ", flush=True)
+            else:
+                # Handle case where panel is None but shouldn't be?
+                print("Panel validation skipped/failed?", end=" ", flush=True)
+
+            # 3. Get & Validate Main Data
+            start_time = time.time()
+            raw_data_df: pl.DataFrame = self.reader.get_dataframe()
+            end_time = time.time()
+            print(f"({end_time - start_time:.5f}s)", end=" ", flush=True)
             validated_data_df = MibiDataModel.validate(raw_data_df)
             self._data = validated_data_df.lazy()
-            print("(Data OK)", end=" ", flush=True)
 
-            # 4. Validate Panel (File panel only if no user panel exists)
-            if self._panel is None:
-                self._panel = MibiFilePanelModel.validate(file_panel_df)
-                print("(File Panel OK)")
-            else:
-                print("(Using User Panel)")
-
+            # 4. Set internal state
+            self._n_x_pixels = n_x_pixels
+            self._n_y_pixels = n_y_pixels
             self._loaded_data = True
 
         except (pt.DataFrameValidationError, Exception) as e:
+            # Reset state on error
             self._data = None
             self._mass_calibration = None
-            if "file_panel_df" in locals() and self._panel is file_panel_df:
-                self._panel = None
             self._loaded_data = False
             print(f"\nError loading/validating file {self.file_path}: {e}")
             raise e
 
+    # --- Core Data Properties --- #
+
     @property
-    def data(self) -> pl.LazyFrame:
+    def data(self) -> pt.LazyFrame[MibiDataModel]:
         """Lazily loads and returns the pixel data LazyFrame."""
         self._load_data_if_needed()
         assert self._data is not None
@@ -125,6 +169,8 @@ class MibiFile:
         self._load_data_if_needed()
         assert self._mass_calibration is not None
         return self._mass_calibration
+
+    # --- Panel Operations --- #
 
     def add_tof_ranges_to_panel(self) -> None:
         """
@@ -158,88 +204,6 @@ class MibiFile:
             allow_superfluous_columns=True,
         )
 
-    def get_all_channel_images(self, sparsity: bool = False) -> xr.DataArray:
-        """Generates a dictionary of 2D NumPy arrays, one for each channel in the panel.
-
-        Returns
-        -------
-            A dictionary where keys are channel names (from 'target' or 'channel_name')
-            and values are 2D NumPy arrays (dtype=np.uint32) representing pulse counts.
-
-        Raises
-        ------
-            AttributeError: If data hasn't been loaded successfully or panel is missing.
-        """
-        start_time = time.time()
-        self._load_data_if_needed()
-
-        if self._panel is None:
-            raise AttributeError("Panel data not loaded or is missing.")
-
-        if "lower_tof_range" not in self.panel.columns:
-            print("TOF ranges not found in panel, calculating now...")
-            self.add_tof_ranges_to_panel()  # Modifies self.panel in place
-
-        channel_col = "target" if "target" in self.panel.columns else "channel_name"
-        if channel_col not in self.panel.columns:
-            raise AttributeError("Panel missing channel identifier column ('target' or 'channel_name').")
-
-        # Prepare panel for iteration (it's small and eager)
-        panel_to_iterate = self.panel.select(channel_col, "lower_tof_range", "upper_tof_range")
-
-        lazy_frames_to_concat = []
-        channel_names = panel_to_iterate.select(channel_col).to_series().to_list()
-
-        # Create lazy frames for each channel
-
-        for row in panel_to_iterate.sort(channel_col).iter_rows(named=True):
-            channel_name = row[channel_col]
-            lower_tof = row["lower_tof_range"]
-            upper_tof = row["upper_tof_range"]
-
-            lf = (
-                self.data.filter(pl.col("pulse_time").is_between(lower_tof, upper_tof, closed="both"))
-                .with_columns(pl.lit(channel_name).alias(channel_col))
-                # Select only needed columns for aggregation
-                .select("pixel_x", "pixel_y", channel_col)
-            )
-            lazy_frames_to_concat.append(lf)
-
-        # Concatenate and aggregate
-        combined_lf: pl.LazyFrame = pl.concat(lazy_frames_to_concat, how="vertical")
-
-        pixel_counts_all_channels = (
-            combined_lf.group_by([channel_col, "pixel_y", "pixel_x"])
-            .agg(pl.count().alias("counts").cast(pl.UInt32))
-            .collect()
-        )
-
-        # Prepare output structure
-        output_images: dict[str, np.ndarray] = {
-            name: np.zeros((self._size_y_pixels + 1, self._size_x_pixels + 1), dtype=np.uint32)
-            for name in channel_names
-        }
-        stop_time = time.time()
-        print(f"Time taken to gather data and prepare output arrays: {stop_time - start_time:.4f} seconds")
-
-        start_time = time.time()
-
-        print(f"Populating {len(channel_names)} images using optimized method...")
-        for ch_name in channel_names:
-            channel_specific_counts = pixel_counts_all_channels.filter(pl.col(channel_col) == ch_name)
-
-            y_coords = channel_specific_counts.get_column("pixel_y").to_numpy()
-            x_coords = channel_specific_counts.get_column("pixel_x").to_numpy()
-            counts = channel_specific_counts.get_column("counts").to_numpy()
-
-            output_images[ch_name][y_coords, x_coords] = counts
-
-        stop_time = time.time()
-        print(f"Time taken to populate images: {stop_time - start_time:.4f} seconds")
-        img_xr = to_xarray(output_images, sparsity=sparsity)  # type: ignore
-
-        return img_xr
-
     def get_channel_info(self, channel_name: str) -> pl.DataFrame | None:
         """Example: Get panel info for a specific channel using the 'target' column."""
         try:
@@ -248,105 +212,23 @@ class MibiFile:
             print(f"Error filtering panel for channel '{channel_name}': {e}")
             return None
 
-    def get_channel_pulse_widths(self, channel_name: str) -> pl.DataFrame:
-        """
-        Calculates the histogram of pulse widths for a specific channel.
+    # --- Image Generation --- #
 
-        Args:
-            channel_name: The name of the channel (from 'target' or 'channel_name' column).
-
-        Returns
-        -------
-            A Polars DataFrame with columns 'pulse_width' (UInt8) and 'count' (UInt64),
-            representing the frequency of each pulse width within the channel's TOF range.
-
-        Raises
-        ------
-            AttributeError: If data or panel hasn't been loaded or is missing required columns.
-            ValueError: If the specified channel_name is not found in the panel.
-        """
-        self._load_data_if_needed()
-        if self._panel is None or self._data is None:
-            raise AttributeError("Data or panel not loaded.")
-        if "lower_tof_range" not in self.panel.columns:
-            print("TOF ranges not found in panel, calculating now...")
-            self.add_tof_ranges_to_panel()
-
-        channel_info = self.get_channel_info(channel_name)
-        if channel_info is None or channel_info.is_empty():
-            raise ValueError(f"Channel '{channel_name}' not found in the panel.")
-
-        lower_tof = channel_info.select("lower_tof_range").item()
-        upper_tof = channel_info.select("upper_tof_range").item()
-
-        width_histogram = (
-            self.data.filter(pl.col("pulse_time").is_between(lower_tof, upper_tof, closed="both"))
-            .group_by("pulse_width")
-            .agg(pl.count())  # Default output column name is 'count'
-            .sort("pulse_width")
-            .collect()
-        )
-        return width_histogram
-
-    def get_channel_pulse_intensities(self, channel_name: str) -> pl.DataFrame:
-        """
-        Calculates the histogram of pulse intensities for a specific channel.
-
-        Args:
-            channel_name: The name of the channel (from 'target' or 'channel_name' column).
-
-        Returns
-        -------
-            A Polars DataFrame with columns 'pulse_intensity' (UInt16) and 'count' (UInt64),
-            representing the frequency of each pulse intensity within the channel's TOF range.
-
-        Raises
-        ------
-            AttributeError: If data or panel hasn't been loaded or is missing required columns.
-            ValueError: If the specified channel_name is not found in the panel.
-        """
-        self._load_data_if_needed()
-        if self._panel is None or self._data is None:
-            raise AttributeError("Data or panel not loaded.")
-        if "lower_tof_range" not in self.panel.columns:
-            print("TOF ranges not found in panel, calculating now...")
-            self.add_tof_ranges_to_panel()
-
-        channel_info = self.get_channel_info(channel_name)
-        if channel_info is None or channel_info.is_empty():
-            raise ValueError(f"Channel '{channel_name}' not found in the panel.")
-
-        lower_tof = channel_info.select("lower_tof_range").item()
-        upper_tof = channel_info.select("upper_tof_range").item()
-
-        intensity_histogram = (
-            self.data.filter(pl.col("pulse_time").is_between(lower_tof, upper_tof, closed="both"))
-            .group_by("pulse_intensity")
-            .agg(pl.count())  # Default output column name is 'count'
-            .sort("pulse_intensity")
-            .collect()
-        )
-        return intensity_histogram
-
-    def get_all_channel_intensity_images(self, sparsity: bool = False) -> xr.DataArray:
-        """Create an Xarray DataArray of the multichannel intensity image.
-
-        Returns
-        -------
-            An xarray DataArray where coordinates are channel names and pixel coordinates,
-            and values are 2D NumPy arrays (dtype=np.uint64) representing summed pulse intensities.
-
-        Raises
-        ------
-            AttributeError: If data hasn't been loaded successfully or panel is missing.
-        """
-        start_time = time.time()
+    def _generate_channel_images(
+        self,
+        aggregation_expr: pl.Expr,
+        output_dtype: type,
+        required_data_cols: list[str],
+        result_col_alias: str,
+        log_suffix: str,
+    ) -> xr.DataArray:
+        """Internal helper to generate multichannel images based on an aggregation."""
         self._load_data_if_needed()
 
         if self._panel is None or self._data is None:
             raise AttributeError("Panel or data not loaded or is missing.")
 
-        if "lower_tof_range" not in self.panel.columns:
+        if "lower_tof_range" not in self.panel.columns or "upper_tof_range" not in self.panel.columns:
             print("TOF ranges not found in panel, calculating now...")
             self.add_tof_ranges_to_panel()
 
@@ -358,130 +240,178 @@ class MibiFile:
         panel_to_iterate = self.panel.select(channel_col, "lower_tof_range", "upper_tof_range")
         channel_names = panel_to_iterate.select(channel_col).to_series().to_list()
 
-        lazy_frames_to_concat = []
-        print(f"Preparing lazy frames for {len(channel_names)} intensity images...")
-        for row in panel_to_iterate.sort(channel_col).iter_rows(named=True):
-            channel_name = row[channel_col]
-            lower_tof = row["lower_tof_range"]
-            upper_tof = row["upper_tof_range"]
-
-            lf = (
-                self.data.filter(pl.col("pulse_time").is_between(lower_tof, upper_tof, closed="both"))
-                .with_columns(pl.lit(channel_name).alias(channel_col))
-                # Select needed columns for aggregation
-                .select("pixel_x", "pixel_y", channel_col, "pulse_intensity")
-            )
-            lazy_frames_to_concat.append(lf)
-
-        # Concatenate and aggregate
-        combined_lf: pl.LazyFrame = pl.concat(lazy_frames_to_concat, how="vertical")
-
-        pixel_intensities_all_channels = (
-            combined_lf.group_by([channel_col, "pixel_y", "pixel_x"])
-            .agg(pl.sum("pulse_intensity").alias("sum_intensity").cast(pl.UInt64))
-            .collect()
-        )
-
-        # Prepare output structure (using uint64 for potentially large sums)
+        # Prepare output structure - Initialized before the loop
         output_images: dict[str, NDArray] = {
-            name: np.zeros((self._size_y_pixels + 1, self._size_x_pixels + 1), dtype=np.uint64)
-            for name in channel_names
+            name: np.zeros((self._n_y_pixels, self._n_x_pixels), dtype=output_dtype) for name in channel_names
         }
-        stop_time = time.time()
-        print(f"Time taken to gather data and prepare output arrays: {stop_time - start_time:.4f} seconds")
 
-        start_time = time.time()
-        print(f"Populating {len(channel_names)} intensity images...")
-        for ch_name in channel_names:
-            channel_specific_intensities = pixel_intensities_all_channels.filter(pl.col(channel_col) == ch_name)
-
-            y_coords = channel_specific_intensities.get_column("pixel_y").to_numpy()
-            x_coords = channel_specific_intensities.get_column("pixel_x").to_numpy()
-            intensities = channel_specific_intensities.get_column("sum_intensity").to_numpy()
-
-            output_images[ch_name][y_coords, x_coords] = intensities
-
-        stop_time = time.time()
-        print(f"Time taken to populate images: {stop_time - start_time:.4f} seconds")
-        img_xr = to_xarray(output_images, sparsity=sparsity)
-
-        return img_xr
-
-    def get_all_channel_intensity_width_images(self, sparsity: bool = False) -> xr.DataArray:
-        """Create an Xarray DataArray of the multichannel intensity*width image.
-
-        Returns
-        -------
-            An xarray DataArray where coordinates are channel names and pixel coordinates,
-            and values are 2D NumPy arrays (dtype=np.uint64) representing summed (intensity * width).
-
-        Raises
-        ------
-            AttributeError: If data hasn't been loaded successfully or panel is missing.
-        """
-        start_time = time.time()
-        self._load_data_if_needed()
-
-        if self._panel is None or self._data is None:
-            raise AttributeError("Panel or data not loaded or is missing.")
-
-        if "lower_tof_range" not in self.panel.columns:
-            print("TOF ranges not found in panel, calculating now...")
-            self.add_tof_ranges_to_panel()
-
-        channel_col = "target" if "target" in self.panel.columns else "channel_name"
-        if channel_col not in self.panel.columns:
-            raise AttributeError("Panel missing channel identifier column ('target' or 'channel_name').")
-
-        # Prepare panel
-        panel_to_iterate = self.panel.select(channel_col, "lower_tof_range", "upper_tof_range")
-        channel_names = panel_to_iterate.select(channel_col).to_series().to_list()
-
-        lazy_frames_to_concat = []
-        print(f"Preparing lazy frames for {len(channel_names)} intensity*width images...")
-        for row in panel_to_iterate.sort(channel_col).iter_rows(named=True):
+        for row in tqdm(panel_to_iterate.sort(channel_col).iter_rows(named=True), total=len(panel_to_iterate)):
             channel_name = row[channel_col]
             lower_tof = row["lower_tof_range"]
             upper_tof = row["upper_tof_range"]
 
-            lf = (
+            # Filter data for the current channel, select necessary columns and aggregate *only* for this channel
+            pixel_aggregated_channel = (
                 self.data.filter(pl.col("pulse_time").is_between(lower_tof, upper_tof, closed="both"))
-                .with_columns(pl.lit(channel_name).alias(channel_col))
-                # Select needed columns for aggregation
-                .select("pixel_x", "pixel_y", channel_col, "pulse_intensity", "pulse_width")
+                .select(["pixel_y", "pixel_x"] + required_data_cols)
+                .group_by(["pixel_y", "pixel_x"])
+                .agg(aggregation_expr)
+                .collect()
             )
-            lazy_frames_to_concat.append(lf)
 
-        # Concatenate and aggregate
-        combined_lf: pl.LazyFrame = pl.concat(lazy_frames_to_concat, how="vertical")
+            # Populate the NumPy array for this channel
+            if not pixel_aggregated_channel.is_empty():
+                y_coords: NDArray = pixel_aggregated_channel.get_column("pixel_y").to_numpy(allow_copy=False)
+                x_coords: NDArray = pixel_aggregated_channel.get_column("pixel_x").to_numpy(allow_copy=False)
+                values: NDArray = pixel_aggregated_channel.get_column(result_col_alias).to_numpy(allow_copy=False)
+                output_images[channel_name][y_coords, x_coords] = values
 
-        pixel_intensity_widths_all_channels = (
-            combined_lf.group_by([channel_col, "pixel_y", "pixel_x"])
-            .agg((pl.col("pulse_intensity") * pl.col("pulse_width")).sum().alias("sum_intensity_width").cast(pl.UInt64))
-            .collect()
+        img_xr = to_xarray(
+            output_images,
+            name=format_image_name(self.fov_id, self.fov_name),
+            sparsity=self.sparsity,
+            scale={
+                C: 1,
+                X: self.fov_size_microns / self._n_x_pixels,
+                Y: self.fov_size_microns / self._n_y_pixels,
+            },
+        )
+        return img_xr
+
+    @cached_property
+    def counts_image(self) -> xr.DataArray:
+        """Returns the counts image (computed on first access)."""
+        return self._generate_channel_images(
+            aggregation_expr=pl.count().alias("counts"),
+            output_dtype=ndt.UInt32,
+            required_data_cols=[],
+            result_col_alias="counts",
+            log_suffix="count images",
         )
 
-        # Prepare output structure (using uint64 for potentially large sums)
-        output_images: Mapping[str, np.ndarray] = {
-            name: np.zeros((self._size_y_pixels + 1, self._size_x_pixels + 1), dtype=np.uint64)
-            for name in channel_names
+    @cached_property
+    def intensity_image(self) -> xr.DataArray:
+        """Returns the intensity image (computed on first access)."""
+        return self._generate_channel_images(
+            aggregation_expr=pl.sum("pulse_intensity").alias("sum_intensity"),
+            output_dtype=ndt.Int64,
+            required_data_cols=["pulse_intensity"],
+            result_col_alias="sum_intensity",
+            log_suffix="intensity images",
+        )
+
+    @cached_property
+    def intensity_width_image(self) -> xr.DataArray:
+        """Returns the intensity*width image (computed on first access)."""
+        return self._generate_channel_images(
+            aggregation_expr=(pl.col("pulse_intensity") * pl.col("pulse_width")).sum().alias("sum_intensity_width"),
+            output_dtype=ndt.Int64,
+            required_data_cols=["pulse_intensity", "pulse_width"],
+            result_col_alias="sum_intensity_width",
+            log_suffix="intensity*width images",
+        )
+
+    # --- Data Export --- #
+
+    def write_data(self, file_path: PathLike, **kwargs: Unpack[WriteParquetKwargs]) -> None:
+        """Writes the raw pulse data (LazyFrame) to a Parquet file."""
+        self._load_data_if_needed()
+        output_path = UPath(file_path)
+        self.data.collect().write_parquet(output_path, **kwargs)
+
+    def _configure_zarr(self):
+        """Sets the global zarr configuration for optimized writing."""
+        import zarr
+        import zarrs  # noqa: F401
+
+        zarr.config.set(
+            {
+                "threading.max_workers": None,
+                "array.write_empty_chunks": False,
+                "codec_pipeline": {
+                    "path": "zarrs.ZarrsCodecPipeline",
+                    "validate_checksums": True,
+                    "store_empty_chunks": False,
+                    "chunk_concurrent_maximum": None,
+                    "chunk_concurrent_minimum": 4,
+                    "batch_size": 1,
+                },
+            }
+        )
+
+    def write_dataset_to_zarr(self, store: StoreLike):
+        """Convert the generated image DataArrays to a Dataset and write to a Zarr store."""
+        self._configure_zarr()
+        import xarray as xr
+
+        xr.Dataset(
+            data_vars={
+                "counts": self.counts_image,
+                "intensity": self.intensity_image,
+                "intensity_width": self.intensity_width_image,
+            },
+            coords={
+                C: self.counts_image.coords[C].to_list(),
+                X: self.counts_image.coords[X].to_list(),
+                Y: self.counts_image.coords[Y].to_list(),
+            },
+        ).to_zarr(store, consolidated=True)  # type: ignore
+
+    def write_ome_zarr(
+        self, output_directory: PathLike, image_type: list[Literal["counts", "intensity", "intensity_width"]]
+    ):
+        """
+        Write specified image types to individual OME-Zarr stores in a directory.
+
+        Args:
+            output_directory: The directory where the OME-Zarr stores will be created.
+            image_type: A list of image types to write (e.g., ["counts", "intensity"]).
+                      Valid types are "counts", "intensity", "intensity_width".
+        """
+        self._configure_zarr()  # Call helper method
+        self._load_data_if_needed()  # Ensure data/dims are loaded
+
+        from ngff_zarr import to_multiscales, to_ngff_image, to_ngff_zarr
+
+        # Create the output directory if it doesn't exist
+        out_dir = UPath(output_directory)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Map image type names to their corresponding DataArray properties
+        image_map = {
+            "counts": self.counts_image,
+            "intensity": self.intensity_image,
+            "intensity_width": self.intensity_width_image,
         }
-        stop_time = time.time()
-        print(f"Time taken to gather data and prepare output arrays: {stop_time - start_time:.4f} seconds")
 
-        start_time = time.time()
-        print(f"Populating {len(channel_names)} intensity*width images...")
-        for ch_name in channel_names:
-            channel_specific_data = pixel_intensity_widths_all_channels.filter(pl.col(channel_col) == ch_name)
+        for img_type in image_type:
+            img_data = image_map[img_type]
+            run_dir = out_dir / self.run_name
+            run_dir.mkdir(parents=True, exist_ok=True)
 
-            y_coords = channel_specific_data.get_column("pixel_y").to_numpy()
-            x_coords = channel_specific_data.get_column("pixel_x").to_numpy()
-            intensity_widths = channel_specific_data.get_column("sum_intensity_width").to_numpy()
+            output_path = run_dir / f"{self.reader.fov_name}-{img_type}.ome.zarr"
 
-            output_images[ch_name][y_coords, x_coords] = intensity_widths
+            ngff_image = to_ngff_image(
+                data=img_data,
+                dims=[C, X, Y],
+                scale={
+                    C: 1,
+                    Y: self.fov_size_microns / self._n_y_pixels,
+                    X: self.fov_size_microns / self._n_x_pixels,
+                },
+                translation=None,
+                name=f"{self.reader.fov_name}_{img_type}",  # Use specific name
+                axes_units={X: "micrometer", Y: "micrometer"},  # Assuming micrometer
+            )
+            multiscales = to_multiscales(
+                ngff_image,
+                scale_factors=[{Y: 1, X: 1}],
+                chunks={C: 1, X: self._n_x_pixels, Y: self._n_y_pixels},
+            )
 
-        stop_time = time.time()
-        print(f"Time taken to populate images: {stop_time - start_time:.4f} seconds")
-        img_xr = to_xarray(output_images, sparsity=sparsity)  # type: ignore
-
-        return img_xr
+            # Write the specific image to its own zarr store
+            to_ngff_zarr(
+                str(output_path),
+                multiscales=multiscales,
+                consolidated=True,
+            )
