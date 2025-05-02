@@ -31,7 +31,6 @@ struct MibiReader {
     mibi_file: MibiFile,
     num_chunks: usize,
     dataframe: Option<DataFrame>,
-    file_path_str: String,
 }
 
 #[pymethods]
@@ -57,7 +56,6 @@ impl MibiReader {
             mibi_file,
             num_chunks,
             dataframe: None,
-            file_path_str: path_str.to_string(),
         })
     }
 

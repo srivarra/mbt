@@ -1624,7 +1624,7 @@ requires-dist = [
     { name = "orjson", marker = "extra == 'nb'", specifier = ">=3.10.18" },
     { name = "pandas", marker = "extra == 'doc'" },
     { name = "patito", specifier = ">=0.8.3" },
-    { name = "polars", specifier = ">=1.29.0" },
+    { name = "polars", specifier = ">=1.29" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pydantic", specifier = ">=2.11.4" },
     { name = "pytest", marker = "extra == 'test'" },
@@ -1643,12 +1643,12 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "typer", specifier = ">=0.15.3" },
     { name = "universal-pathlib" },
-    { name = "xarray", extras = ["accel", "parallel"], specifier = ">=2025.4.0" },
+    { name = "xarray", extras = ["accel", "parallel"], specifier = ">=2025.4" },
     { name = "zarr", marker = "extra == 'tensorstore'" },
     { name = "zarr", marker = "extra == 'zarr'" },
     { name = "zarrs", marker = "extra == 'zarr'", specifier = ">=0.1.4" },
 ]
-provides-extras = ["dev", "doc", "nb", "tensorstore", "test", "zarr", "tiff"]
+provides-extras = ["dev", "doc", "nb", "tensorstore", "test", "tiff", "zarr"]
 
 [[package]]
 name = "mdit-py-plugins"

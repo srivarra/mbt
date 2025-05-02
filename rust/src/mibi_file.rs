@@ -170,9 +170,8 @@ impl MibiFile {
         let chunk_dfs: Vec<DataFrame> = chunk_ranges
             .par_iter()
             .map(|(start, end)| self.parse_region_to_dataframe(*start, *end))
-            .collect::<Result<Vec<_>, _>>()?; // Collect into Result<Vec<DataFrame>, Error>
+            .collect::<Result<Vec<_>, _>>()?;
 
-        // Use itertools::fold to concatenate the DataFrames sequentially
         chunk_dfs
             .into_iter()
             .fold(Ok(DataFrame::default()), |acc_result, next_df| {

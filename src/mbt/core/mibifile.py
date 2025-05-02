@@ -1,7 +1,12 @@
 from collections.abc import Sequence
 from functools import cached_property, wraps
 from os import PathLike
-from typing import Any, Literal, TypedDict, Unpack
+from typing import Any, Literal
+
+try:
+    from typing import TypedDict, Unpack
+except ImportError:
+    from typing_extensions import TypedDict, Unpack
 
 import numpy as np
 import numpydantic.dtype as ndt
@@ -130,7 +135,7 @@ class MibiFile:
         # Returning False (or omitting return) propagates exceptions
         pass
 
-    # --- Core Data Properties (Cached or Standard) --- #
+    # --- Core Data Properties --- #
 
     @cached_property
     @_property_loader
@@ -192,7 +197,7 @@ class MibiFile:
         """(Cached) Returns the FOV size in microns."""
         return self.reader.fov_size_microns
 
-    # --- Newly Added Instrument/Acquisition Properties --- #
+    # --- Instrument/Acquisition Properties --- #
 
     @cached_property
     @_property_loader
@@ -465,12 +470,20 @@ class MibiFile:
     # --- Data Export --- #
 
     def write_data(self, file_path: PathLike, **kwargs: Unpack[WriteParquetKwargs]) -> None:
-        """Writes the raw pulse data (LazyFrame) to a Parquet file."""
+        """Write the raw pulse data (LazyFrame) to a Parquet file.
+
+        Parameters
+        ----------
+        file_path
+            Path to the output file.
+        kwargs
+            Additional keyword arguments to pass to `pl.DataFrame.write_parquet`.
+        """
         output_path = UPath(file_path)
         # Access self.data property to trigger loading/validation if not already done
         self.data.collect().write_parquet(output_path, **kwargs)
 
-    def _configure_zarr(self):
+    def _configure_zarr(self) -> None:
         """Sets the global zarr configuration for optimized writing."""
         try:
             import zarr
@@ -496,8 +509,14 @@ class MibiFile:
     def write_dataset_to_zarr(
         self,
         output_directory: PathLike,
-    ):
-        """Write the generated image DataArrays to an Xarray Dataset Zarr store."""
+    ) -> None:
+        """Write the generated image DataArrays to an Xarray Dataset Zarr store.
+
+        Parameters
+        ----------
+        output_directory
+            Path to the output directory.
+        """
         self._configure_zarr()
 
         # Access properties to trigger generation/loading
@@ -526,8 +545,23 @@ class MibiFile:
         self,
         output_directory: PathLike,
         image_type: list[Literal["counts", "intensity", "intensity_width"]] | str | list[str] | None = None,
-    ):
-        """Write specified image types to individual OME-Zarr stores."""
+    ) -> None:
+        """Write specified image types to individual OME-Zarr stores.
+
+        Parameters
+        ----------
+        output_directory
+            Path to the output directory.
+        image_type
+            Image types to write. Defaults to all available types.
+
+        Raises
+        ------
+        ImportError
+            If ngff-zarr is not installed.
+        ValueError
+            If an invalid image type is requested.
+        """
         self._configure_zarr()
         # Access properties needed for metadata/scaling
         run_fmt_name = self.formatted_run_name
