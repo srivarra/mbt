@@ -68,27 +68,30 @@ def _create_details_panel(f: MibiFile) -> Panel:
     fov_id: str = f.fov_id
     fov_name: str = f.fov_name
     acq_status: str = f.acquisition_status
-    mass_calibration: MassCalibrationModel | None = f.mass_calibration
-    time_resolution: float = f.time_resolution
-
-    mc_offset = 0.0
-    mc_gain = 0.0
-    if mass_calibration:
-        mc_offset = mass_calibration.mass_offset
-        mc_gain = mass_calibration.mass_gain
 
     details_str = (
         f"Run Name : {run_name}\n"
         f"Run UUID : {run_uuid}\n"
         f"FOV ID   : {fov_id}\n"
         f"FOV Name : {fov_name}\n"
-        f"Acq Stat : {acq_status}\n"
-        f"---------- Mass Calibration ----------\n"
-        f"Offset   : {mc_offset:.4f}\n"
-        f"Gain     : {mc_gain:.4f}\n"
-        f"Time Res.: {time_resolution:.4e} s"
+        f"Acq Stat : {acq_status}"
     )
     return Panel(details_str, title="File & FOV Details", border_style="green", expand=False)
+
+
+def _create_mass_cal_panel(f: MibiFile) -> Panel:
+    """Creates the Mass Calibration details panel."""
+    mass_calibration: MassCalibrationModel | None = f.mass_calibration
+    time_resolution: float = f.time_resolution
+
+    mc_offset_str = "N/A"
+    mc_gain_str = "N/A"
+    if mass_calibration:
+        mc_offset_str = f"{mass_calibration.mass_offset:.4f}"
+        mc_gain_str = f"{mass_calibration.mass_gain:.4f}"
+
+    mass_cal_str = f"Offset   : {mc_offset_str}\nGain     : {mc_gain_str}\nTime Res.: {time_resolution:.4e} s"
+    return Panel(mass_cal_str, title="Mass Calibration", border_style="yellow", expand=False)
 
 
 def _create_instr_acq_panel(f: MibiFile) -> Panel:
@@ -138,9 +141,11 @@ def info(path: Path = typer.Argument(..., help="Path to the Mibi file")):
             details_panel = _create_details_panel(f)
             instr_acq_panel = _create_instr_acq_panel(f)
             panel_details_renderable = _create_panel_details_renderable(f)
+            mass_cal_panel = _create_mass_cal_panel(f)
 
             # --- Render Info Panels Side-by-Side and Centered ---
-            info_columns = Columns([dimension_group, details_panel, instr_acq_panel])
+            details_mass_cal_group = Group(details_panel, mass_cal_panel)
+            info_columns = Columns([dimension_group, details_mass_cal_group, instr_acq_panel])
             centered_columns = Align.center(info_columns)
             console.print(centered_columns)
 

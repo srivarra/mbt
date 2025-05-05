@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import Sequence
 from functools import cached_property, wraps
 from os import PathLike
@@ -24,6 +26,7 @@ from mbt._core import MibiReader
 from mbt.core.models import C, MassCalibrationModel, MibiDataModel, MibiFilePanelModel, UserPanelModel, X, Y
 from mbt.core.utils import _set_tof_ranges, format_image_name, format_run_name
 from mbt.im import to_xarray
+from mbt.io import zarr as zarr_io
 
 
 # Helper decorator to handle potential errors during property loading
@@ -36,7 +39,7 @@ def _property_loader(func):
         except (pt.DataFrameValidationError, Exception) as e:
             prop_name = func.__name__
             logger.error(f"Error loading property '{prop_name}' for file {self.file_path}: {e}")
-            raise  # Re-raise the original exception
+            return None
 
     return wrapper
 
@@ -132,7 +135,6 @@ class MibiFile:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        # Returning False (or omitting return) propagates exceptions
         pass
 
     # --- Core Data Properties --- #
@@ -297,6 +299,16 @@ class MibiFile:
             raise AttributeError("Panel could not be loaded or validated.")
 
         return self._panel
+
+    @property
+    def n_masses(self) -> int:
+        """(Cached) Returns the number of masses in the panel."""
+        return len(self.panel.get_column("mass").unique())
+
+    @property
+    def n_targets(self) -> int:
+        """(Cached) Returns the number of targets in the panel."""
+        return len(self.panel.get_column("target").unique())
 
     @cached_property
     @_property_loader
@@ -480,150 +492,117 @@ class MibiFile:
             Additional keyword arguments to pass to `pl.DataFrame.write_parquet`.
         """
         output_path = UPath(file_path)
-        # Access self.data property to trigger loading/validation if not already done
         self.data.collect().write_parquet(output_path, **kwargs)
-
-    def _configure_zarr(self) -> None:
-        """Sets the global zarr configuration for optimized writing."""
-        try:
-            import zarr
-            import zarrs  # noqa: F401
-        except ImportError as e:
-            raise ImportError("zarr and zarrs are required for Zarr/NGFF writing. Install them with mbt[zarr]") from e
-
-        zarr.config.set(
-            {
-                "threading.max_workers": None,
-                "array.write_empty_chunks": False,
-                "codec_pipeline": {
-                    "path": "zarrs.ZarrsCodecPipeline",
-                    "validate_checksums": True,
-                    "store_empty_chunks": False,
-                    "chunk_concurrent_maximum": None,
-                    "chunk_concurrent_minimum": 4,
-                    "batch_size": 1,
-                },
-            }
-        )
 
     def write_dataset_to_zarr(
         self,
         output_directory: PathLike,
+        shard_shape: dict[str, int] | Literal["auto"] | None = "auto",
     ) -> None:
         """Write the generated image DataArrays to an Xarray Dataset Zarr store.
+
+        Calls the utility function `mbt.io.zarr.write_dataset_to_zarr`.
 
         Parameters
         ----------
         output_directory
             Path to the output directory.
+        shard_shape
+            Desired total shape of each shard file (e.g., `(n_masses, ny, nx)`).
+            If "auto" (default), uses the full variable shape.
+            Passed to the `shards` encoding parameter in `xarray.to_zarr`.
         """
-        self._configure_zarr()
-
         # Access properties to trigger generation/loading
         counts = self.counts_image
         intensity = self.intensity_image
         intensity_width = self.intensity_width_image
         run_fmt_name = self.formatted_run_name
         fov_fmt_name = self.formatted_fov_name
+        ny = self.n_y_pixels
+        nx = self.n_x_pixels
+        n_masses = self.n_masses
 
-        out_dir = UPath(output_directory) / run_fmt_name
-        out_dir.mkdir(parents=True, exist_ok=True)
-        output_path = out_dir / f"{fov_fmt_name}.zarr"
-        print(f"(Writing Dataset to Zarr: {output_path})", end=" ", flush=True)
-
-        xr.Dataset(
+        img_ds = xr.Dataset(
             data_vars={
                 "counts": counts,
                 "intensity": intensity,
                 "intensity_width": intensity_width,
             },
             coords=counts.coords,
-        ).to_zarr(output_path, consolidated=True, mode="w")
-        logger.info("Dataset Zarr written.")
+        )
+
+        # Define storage chunks consistent with OME-Zarr approach
+        storage_chunks = {C: 1, Y: min(ny, 256), X: min(nx, 256)}
+
+        zarr_io.write_dataset_to_zarr(
+            dataset=img_ds,
+            output_directory=output_directory,
+            run_fmt_name=run_fmt_name,
+            fov_fmt_name=fov_fmt_name,
+            n_masses=n_masses,
+            ny=ny,
+            nx=nx,
+            storage_chunks=storage_chunks,  # Pass defined storage chunks
+            shard_shape=shard_shape,
+        )
 
     def write_ome_zarr(
         self,
         output_directory: PathLike,
         image_type: list[Literal["counts", "intensity", "intensity_width"]] | str | list[str] | None = None,
+        scale_factors: list[dict[str, int]] | None = None,
+        chunks_per_shard: dict[str, int] | Literal["auto"] | None = "auto",
     ) -> None:
         """Write specified image types to individual OME-Zarr stores.
+
+        Calls the utility function `mbt.io.zarr.write_ome_zarr`.
 
         Parameters
         ----------
         output_directory
             Path to the output directory.
         image_type
-            Image types to write. Defaults to all available types.
+            Image types to write. Defaults to all available types (counts, intensity, intensity_width).
+        scale_factors
+            List of scale factors to apply to the image. Defaults to `None`.
+        chunks_per_shard
+            Optional chunking configuration for zarr shards. Defaults to 'auto'.
 
         Raises
         ------
         ImportError
-            If ngff-zarr is not installed.
+            If ngff-zarr is not installed (raised by the utility function).
         ValueError
-            If an invalid image type is requested.
+            If an invalid image type is requested (raised by the utility function).
         """
-        self._configure_zarr()
         # Access properties needed for metadata/scaling
         run_fmt_name = self.formatted_run_name
         fov_fmt_name = self.formatted_fov_name
-        fov_microns = self.fov_size_microns
         ny = self.n_y_pixels
         nx = self.n_x_pixels
+        n_masses = self.n_masses
+        fov_microns = self.fov_size_microns
 
-        try:
-            from ngff_zarr import to_multiscales, to_ngff_image, to_ngff_zarr
-        except ImportError as e:
-            raise ImportError("ngff-zarr is required for OME-Zarr writing. Install with mbt[zarr]") from e
+        # Gather image data
+        image_data = {
+            "counts": self.counts_image,
+            "intensity": self.intensity_image,
+            "intensity_width": self.intensity_width_image,
+        }
 
-        out_dir = UPath(output_directory) / run_fmt_name
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        if image_type is None:
-            image_type = ["counts", "intensity", "intensity_width"]
-        if isinstance(image_type, str):
-            image_type = [image_type]
-
-        # Validate requested types
-        valid_types = {"counts", "intensity", "intensity_width"}
-        requested_types = set(image_type)
-        if not requested_types.issubset(valid_types):
-            invalid = requested_types - valid_types
-            raise ValueError(f"Invalid image_type requested: {invalid}. Valid types are: {valid_types}")
-
-        for img_type in image_type:
-            img_data = getattr(self, f"{img_type}_image")
-            output_path = out_dir / f"{fov_fmt_name}-{img_type}.ome.zarr"
-
-            ngff_image = to_ngff_image(
-                data=img_data,
-                dims=[C, Y, X],
-                scale={
-                    C: 1,
-                    Y: fov_microns / ny,
-                    X: fov_microns / nx,
-                },
-                translation=None,
-                name=f"{self.formatted_fov_name}_{img_type}",
-                axes_units={X: "micrometer", Y: "micrometer"},
-            )
-
-            scale_factors = [{"y": 2, "x": 2}] * 1
-
-            base_chunk_y = min(ny, 256)
-            base_chunk_x = min(nx, 256)
-            chunks = {C: 1, Y: base_chunk_y, X: base_chunk_x}
-
-            multiscales = to_multiscales(
-                ngff_image,
-                scale_factors=scale_factors,
-                chunks=chunks,
-            )
-
-            to_ngff_zarr(
-                output_path,
-                multiscales=multiscales,
-                overwrite=True,
-            )
+        zarr_io.write_ome_zarr(
+            image_data=image_data,
+            output_directory=output_directory,
+            run_fmt_name=run_fmt_name,
+            fov_fmt_name=fov_fmt_name,
+            ny=ny,
+            nx=nx,
+            n_masses=n_masses,
+            fov_microns=fov_microns,
+            image_type=image_type,
+            scale_factors=scale_factors,
+            chunks_per_shard=chunks_per_shard,
+        )
 
     def write_tifffile(self, ome: bool = False, output_directory: PathLike | None = None):
         """Write the generated image DataArrays to a TIFF file."""
