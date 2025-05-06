@@ -1,4 +1,5 @@
 from datetime import date
+from enum import StrEnum
 
 import patito as pt
 import polars as pl
@@ -65,3 +66,11 @@ class MassCalibrationModel(BaseModel):
     )
 
     model_config = ConfigDict(strict=True, populate_by_name=True, extra="allow")
+
+
+class ImageType(StrEnum):
+    """Enum for the type of image."""
+
+    counts = "counts"
+    intensity = "intensity"
+    intensity_width = "intensity_width"

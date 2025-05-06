@@ -23,10 +23,9 @@ from tqdm.auto import tqdm
 from upath import UPath
 
 from mbt._core import MibiReader
-from mbt.core.models import C, MassCalibrationModel, MibiDataModel, MibiFilePanelModel, UserPanelModel, X, Y
+from mbt.core.models import C, ImageType, MassCalibrationModel, MibiDataModel, MibiFilePanelModel, UserPanelModel, X, Y
 from mbt.core.utils import _set_tof_ranges, format_image_name, format_run_name
 from mbt.im import to_xarray
-from mbt.io import zarr as zarr_io
 
 
 # Helper decorator to handle potential errors during property loading
@@ -341,14 +340,12 @@ class MibiFile:
         """
         # Access properties to ensure they are loaded
         current_panel = self.panel
-        mc = self.mass_calibration
-        tr = self.time_resolution  # Uses override or mc value
 
         panel_with_ranges = _set_tof_ranges(
             panel=current_panel,  # Use the currently loaded panel
-            mass_offset=mc.mass_offset,
-            mass_gain=mc.mass_gain,
-            time_resolution=tr,
+            mass_offset=self.mass_calibration.mass_offset,
+            mass_gain=self.mass_calibration.mass_gain,
+            time_resolution=self.time_resolution,
         )
 
         validation_model = UserPanelModel if self._user_panel is not None else MibiFilePanelModel
@@ -374,7 +371,7 @@ class MibiFile:
         output_dtype: type,
         required_data_cols: list[str],
         result_col_alias: str,
-        name_suffix: str,
+        image_type: ImageType,
     ) -> xr.DataArray:
         """Internal helper to generate multichannel images based on an aggregation."""
         # Access properties to trigger loading if needed
@@ -383,7 +380,6 @@ class MibiFile:
         fov_microns = self.fov_size_microns
         nx = self.n_x_pixels
         ny = self.n_y_pixels
-        fov_fmt_name = self.formatted_fov_name
 
         # Check if TOF ranges are present, add them if not
         if "lower_tof_range" not in current_panel.columns or "upper_tof_range" not in current_panel.columns:
@@ -402,15 +398,14 @@ class MibiFile:
             .sort("lower_tof_range")
         )
 
-        # Prepare output structure
-        channel_names = grouped_panel.get_column("grouped_channel_name").to_list()
+        channel_names: list[str] = grouped_panel.get_column("grouped_channel_name").to_list()
         output_images: dict[str, NDArray] = {name: np.zeros((ny, nx), dtype=output_dtype) for name in channel_names}
 
         for row in tqdm(
             grouped_panel.iter_rows(named=True),
             total=len(grouped_panel),
-            desc=f"Generating {name_suffix} image",
-            unit="group",
+            desc=f"Generating {image_type} image",
+            unit="masses",
         ):
             grouped_channel_name = row["grouped_channel_name"]
             lower_tof = row["lower_tof_range"]
@@ -434,7 +429,9 @@ class MibiFile:
 
         img_xr = to_xarray(
             output_images,
-            name=f"{fov_fmt_name}_{name_suffix}",
+            run_name=self.formatted_run_name,
+            fov_name=self.formatted_fov_name,
+            image_type=image_type,
             sparsity=self.sparsity,
             scale={
                 C: 1,
@@ -454,7 +451,7 @@ class MibiFile:
             output_dtype=ndt.UInt32,
             required_data_cols=[],
             result_col_alias="counts",
-            name_suffix="counts",
+            image_type=ImageType.counts,
         )
 
     @cached_property
@@ -465,7 +462,7 @@ class MibiFile:
             output_dtype=ndt.Int64,
             required_data_cols=["pulse_intensity"],
             result_col_alias="sum_intensity",
-            name_suffix="intensity",
+            image_type=ImageType.intensity,
         )
 
     @cached_property
@@ -476,7 +473,7 @@ class MibiFile:
             output_dtype=ndt.Int64,
             required_data_cols=["pulse_intensity", "pulse_width"],
             result_col_alias="sum_intensity_width",
-            name_suffix="intensity_width",
+            image_type=ImageType.intensity_width,
         )
 
     # --- Data Export --- #
@@ -512,37 +509,30 @@ class MibiFile:
             If "auto" (default), uses the full variable shape.
             Passed to the `shards` encoding parameter in `xarray.to_zarr`.
         """
+        from mbt.io import write_dataset_to_zarr
+
         # Access properties to trigger generation/loading
-        counts = self.counts_image
-        intensity = self.intensity_image
-        intensity_width = self.intensity_width_image
-        run_fmt_name = self.formatted_run_name
-        fov_fmt_name = self.formatted_fov_name
-        ny = self.n_y_pixels
-        nx = self.n_x_pixels
-        n_masses = self.n_masses
 
         img_ds = xr.Dataset(
             data_vars={
-                "counts": counts,
-                "intensity": intensity,
-                "intensity_width": intensity_width,
+                "counts": self.counts_image,
+                "intensity": self.intensity_image,
+                "intensity_width": self.intensity_width_image,
             },
-            coords=counts.coords,
+            coords=self.counts_image.coords,
         )
 
-        # Define storage chunks consistent with OME-Zarr approach
-        storage_chunks = {C: 1, Y: min(ny, 256), X: min(nx, 256)}
+        storage_chunks = {C: 1, Y: min(self.n_y_pixels, 256), X: min(self.n_x_pixels, 256)}
 
-        zarr_io.write_dataset_to_zarr(
+        write_dataset_to_zarr(
             dataset=img_ds,
             output_directory=output_directory,
-            run_fmt_name=run_fmt_name,
-            fov_fmt_name=fov_fmt_name,
-            n_masses=n_masses,
-            ny=ny,
-            nx=nx,
-            storage_chunks=storage_chunks,  # Pass defined storage chunks
+            run_fmt_name=self.formatted_run_name,
+            fov_fmt_name=self.formatted_fov_name,
+            n_masses=self.n_masses,
+            ny=self.n_y_pixels,
+            nx=self.n_x_pixels,
+            storage_chunks=storage_chunks,
             shard_shape=shard_shape,
         )
 
@@ -575,6 +565,8 @@ class MibiFile:
         ValueError
             If an invalid image type is requested (raised by the utility function).
         """
+        from mbt.io import write_ome_zarr
+
         # Access properties needed for metadata/scaling
         run_fmt_name = self.formatted_run_name
         fov_fmt_name = self.formatted_fov_name
@@ -590,7 +582,7 @@ class MibiFile:
             "intensity_width": self.intensity_width_image,
         }
 
-        zarr_io.write_ome_zarr(
+        write_ome_zarr(
             image_data=image_data,
             output_directory=output_directory,
             run_fmt_name=run_fmt_name,
@@ -604,9 +596,23 @@ class MibiFile:
             chunks_per_shard=chunks_per_shard,
         )
 
-    def write_tifffile(self, ome: bool = False, output_directory: PathLike | None = None):
+    def write_tifffile(
+        self,
+        image_type: ImageType | str | list[str],
+        output_directory: PathLike,
+        ome: bool = False,
+    ):
         """Write the generated image DataArrays to a TIFF file."""
-        raise NotImplementedError("TIFF writing is not yet implemented.")
+        from mbt.io import write_dir_tiffs
+
+        if isinstance(image_type, ImageType):
+            image_type = [image_type]
+        elif isinstance(image_type, str):
+            image_type = [image_type]
+
+        for img_type in image_type:
+            image: xr.DataArray = getattr(self, f"{img_type}_image")
+            write_dir_tiffs(image, output_directory=output_directory)
 
     def to_spatialdata(self):
         """Convert the MibiFile Images to a SpatialData object."""
